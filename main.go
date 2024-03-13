@@ -136,7 +136,7 @@ func service(client *grpc.Client) http.Handler {
 
 	// setup our common headers
 	r.Use(AddCommonHeaders)
-	
+
 	// login route is a debug route to get a JWT, will need better handling in the future
 	if *requireAuth {
 		r.Get("/login", GetJWT)

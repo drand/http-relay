@@ -28,7 +28,7 @@ func NewClient(serverAddr string) (*Client, error) {
 
 // GetBeacon will fetch the requested beacon. Beacons starts at 1, asking for 0 provides the latest, asking for
 // the next one will most likely cause the server to wait until it's produced to send it your way.
-func (c *Client) GetBeacon(m *proto.Metadata, round uint64) (*HexBeacon, error) {
+func (c *Client) GetBeacon(ctx context.Context, m *proto.Metadata, round uint64) (*HexBeacon, error) {
 	client := proto.NewPublicClient(c.conn)
 
 	in := &proto.PublicRandRequest{
@@ -36,7 +36,7 @@ func (c *Client) GetBeacon(m *proto.Metadata, round uint64) (*HexBeacon, error) 
 		Metadata: m,
 	}
 
-	randResp, err := client.PublicRand(context.Background(), in)
+	randResp, err := client.PublicRand(ctx, in)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +44,8 @@ func (c *Client) GetBeacon(m *proto.Metadata, round uint64) (*HexBeacon, error) 
 	return NewHexBeacon(randResp), nil
 }
 
-func (c *Client) GetHealth(m *proto.Metadata) (uint64, *proto.ChainInfoPacket, error) {
+// GetHealth is returning the latest beacon and the chain info for the requested chainhash or beacon ID in the provided Metadata
+func (c *Client) GetHealth(ctx context.Context, m *proto.Metadata) (uint64, *proto.ChainInfoPacket, error) {
 	client := proto.NewPublicClient(c.conn)
 
 	latest := &proto.PublicRandRequest{
@@ -52,7 +53,7 @@ func (c *Client) GetHealth(m *proto.Metadata) (uint64, *proto.ChainInfoPacket, e
 		Metadata: m,
 	}
 
-	randResp, err := client.PublicRand(context.Background(), latest)
+	randResp, err := client.PublicRand(ctx, latest)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -61,7 +62,7 @@ func (c *Client) GetHealth(m *proto.Metadata) (uint64, *proto.ChainInfoPacket, e
 		Metadata: m,
 	}
 
-	info, err := client.ChainInfo(context.Background(), infoReq)
+	info, err := client.ChainInfo(ctx, infoReq)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -69,64 +70,66 @@ func (c *Client) GetHealth(m *proto.Metadata) (uint64, *proto.ChainInfoPacket, e
 	return randResp.GetRound(), info, nil
 }
 
-// NB. this is a breaking change to our API, since renamed a few fields
-type JsonInfo struct {
+// JsonInfoV1 is the V1 representation of the chain info.
+type JsonInfoV1 struct {
 	PublicKey   HexBytes        `json:"public_key"`
 	Period      uint32          `json:"period"`
 	GenesisTime int64           `json:"genesis_time"`
-	GenesisSeed HexBytes        `json:"genesis_seed,omitempty"`
 	Hash        HexBytes        `json:"hash"`
-	GroupHash   HexBytes        `json:"groupHash,omitempty"`
-	BeaconId    string          `json:"beacon_id"`
-	Scheme      string          `json:"scheme,omitempty"`
+	GroupHash   HexBytes        `json:"groupHash"`
 	SchemeID    string          `json:"schemeID,omitempty"`
 	Metadata    *proto.Metadata `json:"metadata,omitempty"`
 }
 
-func (j *JsonInfo) V1() *JsonInfo {
-	return &JsonInfo{
+// JsonInfoV2 is the V2 representation of the chain info, which contains breaking changes compared to V1.
+type JsonInfoV2 struct {
+	PublicKey   HexBytes `json:"public_key"`
+	Period      uint32   `json:"period"`
+	GenesisTime int64    `json:"genesis_time"`
+	GenesisSeed HexBytes `json:"genesis_seed,omitempty"`
+	Hash        HexBytes `json:"chain_hash"`
+	Scheme      string   `json:"scheme"`
+	BeaconId    string   `json:"beacon_id"`
+}
+
+func (j *JsonInfoV2) V1() *JsonInfoV1 {
+	return &JsonInfoV1{
 		PublicKey:   j.PublicKey,
 		Period:      j.Period,
 		GenesisTime: j.GenesisTime,
 		Hash:        j.Hash,
-		GenesisSeed: nil,
 		GroupHash:   j.GenesisSeed,
-		BeaconId:    "",
-		Scheme:      "",
 		SchemeID:    j.Scheme,
 		Metadata:    &proto.Metadata{BeaconID: j.BeaconId},
 	}
 }
 
-func (j *JsonInfo) V2() *JsonInfo {
-	return &JsonInfo{
+func (j *JsonInfoV1) V2() *JsonInfoV2 {
+	return &JsonInfoV2{
 		PublicKey:   j.PublicKey,
 		Period:      j.Period,
 		GenesisTime: j.GenesisTime,
 		Hash:        j.Hash,
-		GenesisSeed: j.GenesisSeed,
-		GroupHash:   nil,
-		BeaconId:    j.BeaconId,
-		Scheme:      j.Scheme,
-		SchemeID:    "",
-		Metadata:    nil,
+		GenesisSeed: j.GroupHash,
+		BeaconId:    j.Metadata.GetBeaconID(),
+		Scheme:      j.SchemeID,
 	}
 }
 
-// GetChainInfo returns the chain info for the requested chainhash
-func (c *Client) GetChainInfo(m *proto.Metadata) (*JsonInfo, error) {
+// GetChainInfo returns the chain info for the requested chainhash or beacon ID in the provided Metadata
+func (c *Client) GetChainInfo(ctx context.Context, m *proto.Metadata) (*JsonInfoV2, error) {
 	client := proto.NewPublicClient(c.conn)
 
 	in := &proto.ChainInfoRequest{
 		Metadata: m,
 	}
 
-	resp, err := client.ChainInfo(context.Background(), in)
+	resp, err := client.ChainInfo(ctx, in)
 	if err != nil {
 		return nil, err
 	}
 
-	info := &JsonInfo{
+	info := &JsonInfoV2{
 		PublicKey:   resp.GetPublicKey(),
 		BeaconId:    resp.GetMetadata().GetBeaconID(),
 		Period:      resp.GetPeriod(),
@@ -141,9 +144,9 @@ func (c *Client) GetChainInfo(m *proto.Metadata) (*JsonInfo, error) {
 
 // GetChains returns an array of chainhashes available on that grpc node. It does 1 ListBeaconIDs call and n calls to
 // get the ChainInfo, so it's a relatively noisy path.
-func (c *Client) GetChains() ([]string, error) {
+func (c *Client) GetChains(ctx context.Context) ([]string, error) {
 	client := proto.NewPublicClient(c.conn)
-	resp, err := client.ListBeaconIDs(context.Background(), &proto.ListBeaconIDsRequest{})
+	resp, err := client.ListBeaconIDs(ctx, &proto.ListBeaconIDsRequest{})
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +157,7 @@ func (c *Client) GetChains() ([]string, error) {
 			Metadata: &proto.Metadata{BeaconID: beaconID},
 		}
 
-		info, err := client.ChainInfo(context.Background(), in)
+		info, err := client.ChainInfo(ctx, in)
 		if err != nil {
 			return nil, err
 		}

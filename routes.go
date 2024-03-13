@@ -17,7 +17,7 @@ import (
 
 func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		m, err := CreateRequestMD(r)
+		m, err := createRequestMD(r)
 		if err != nil {
 			slog.Error("unable to create metadata for request", "error", err)
 			http.Error(w, "Failed to get health", http.StatusInternalServerError)
@@ -31,7 +31,7 @@ func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			return
 		}
 
-		beacon, err := c.GetBeacon(m, round)
+		beacon, err := c.GetBeacon(r.Context(), m, round)
 		if err != nil {
 			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
 			return
@@ -49,7 +49,7 @@ func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 func GetChains(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		chains, err := c.GetChains()
+		chains, err := c.GetChains(r.Context())
 		if err != nil {
 			slog.Error("failed to get chains", "error", err)
 			http.Error(w, "Failed to get chains", http.StatusInternalServerError)
@@ -69,14 +69,14 @@ func GetChains(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 func GetHealth(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		m, err := CreateRequestMD(r)
+		m, err := createRequestMD(r)
 		if err != nil {
 			slog.Error("unable to create metadata for request", "error", err)
 			http.Error(w, "Failed to get health", http.StatusInternalServerError)
 			return
 		}
 
-		latest, info, err := c.GetHealth(m)
+		latest, info, err := c.GetHealth(r.Context(), m)
 		if err != nil {
 			slog.Error("[GetHealth] failed to get chain info", "error", err)
 			http.Error(w, "Failed to get chains for info", http.StatusServiceUnavailable)
@@ -123,14 +123,14 @@ func GetHealth(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 func GetInfoV1(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		m, err := CreateRequestMD(r)
+		m, err := createRequestMD(r)
 		if err != nil {
 			slog.Error("unable to create metadata for request", "error", err)
 			http.Error(w, "Failed to get info", http.StatusInternalServerError)
 			return
 		}
 
-		chains, err := c.GetChainInfo(m)
+		chains, err := c.GetChainInfo(r.Context(), m)
 		if err != nil {
 			slog.Error("failed to get ChainInfo", "error", err)
 			http.Error(w, "Failed to get ChainInfo", http.StatusInternalServerError)
@@ -150,21 +150,21 @@ func GetInfoV1(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 func GetInfoV2(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		m, err := CreateRequestMD(r)
+		m, err := createRequestMD(r)
 		if err != nil {
 			slog.Error("unable to create metadata for request", "error", err)
 			http.Error(w, "Failed to get info", http.StatusInternalServerError)
 			return
 		}
 
-		chains, err := c.GetChainInfo(m)
+		chains, err := c.GetChainInfo(r.Context(), m)
 		if err != nil {
 			slog.Error("failed to get ChainInfo", "error", err)
 			http.Error(w, "Failed to get ChainInfo", http.StatusInternalServerError)
 			return
 		}
 
-		json, err := json.Marshal(chains.V2())
+		json, err := json.Marshal(chains)
 		if err != nil {
 			slog.Error("unable to encode ChainInfo in json", "error", err)
 			http.Error(w, "Failed to encode ChainInfo", http.StatusInternalServerError)
@@ -177,14 +177,14 @@ func GetInfoV2(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 func GetLatest(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		m, err := CreateRequestMD(r)
+		m, err := createRequestMD(r)
 		if err != nil {
 			slog.Error("unable to create metadata for request", "error", err)
 			http.Error(w, "Failed to get latest", http.StatusInternalServerError)
 			return
 		}
 
-		beacon, err := c.GetBeacon(m, 0)
+		beacon, err := c.GetBeacon(r.Context(), m, 0)
 		if err != nil {
 			slog.Error("unable to get beacon from grpc client", "error", err)
 			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
@@ -202,7 +202,7 @@ func GetLatest(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	}
 }
 
-func CreateRequestMD(r *http.Request) (*proto.Metadata, error) {
+func createRequestMD(r *http.Request) (*proto.Metadata, error) {
 	chainhash := chi.URLParam(r, "chainhash")
 	beaconID := chi.URLParam(r, "beaconID")
 
@@ -211,7 +211,7 @@ func CreateRequestMD(r *http.Request) (*proto.Metadata, error) {
 	}
 
 	if len(chainhash) == 64 && beaconID != "" {
-		slog.Warn("[CreateRequestMD] unexpectedly, CreateRequestMD got both a chainhash and a beaconID. Ignoring beaconID")
+		slog.Warn("[createRequestMD] unexpectedly, createRequestMD got both a chainhash and a beaconID. Ignoring beaconID")
 	}
 
 	if beaconID != "" && chainhash == "" {
@@ -220,7 +220,7 @@ func CreateRequestMD(r *http.Request) (*proto.Metadata, error) {
 
 	hash, err := hex.DecodeString(chainhash)
 	if err != nil {
-		slog.Error("[CreateRequestMD] error decoding hex", "chainhash", chainhash, "error", err)
+		slog.Error("[createRequestMD] error decoding hex", "chainhash", chainhash, "error", err)
 		return nil, errors.New("unable to decode chainhash as hex")
 	}
 
