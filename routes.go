@@ -10,10 +10,16 @@ import (
 	"strconv"
 	"time"
 
-	proto "github.com/drand/drand/protobuf/drand"
+	proto "github.com/drand/drand/v2/protobuf/drand"
 	"github.com/drand/http-server/grpc"
 	"github.com/go-chi/chi/v5"
 )
+
+func DisplayRoutes(allRoutes []byte) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(allRoutes)
+	}
+}
 
 func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {

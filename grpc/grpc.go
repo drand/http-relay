@@ -6,7 +6,7 @@ import (
 	"log"
 	"sync"
 
-	proto "github.com/drand/drand/protobuf/drand"
+	proto "github.com/drand/drand/v2/protobuf/drand"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

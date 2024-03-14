@@ -8,9 +8,9 @@ import (
 // HexBeacon is a struct that get marshaled into hex-encoded signatures and randomness in JSON
 type HexBeacon struct {
 	Round             uint64   `json:"round"`
+	Randomness        HexBytes `json:"randomness,omitempty"`
 	Signature         HexBytes `json:"signature"`
 	PreviousSignature HexBytes `json:"previous_signature,omitempty"`
-	Randomness        HexBytes `json:"randomness,omitempty"`
 }
 
 type RandomData interface {

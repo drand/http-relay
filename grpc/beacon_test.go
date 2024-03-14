@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	proto "github.com/drand/drand/protobuf/drand"
+	proto "github.com/drand/drand/v2/protobuf/drand"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

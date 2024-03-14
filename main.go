@@ -47,6 +47,8 @@ func init() {
 	}
 }
 
+//var knownChains map[string]chain.Info
+
 func main() {
 	if *goVersion {
 		log.Fatal("drand http server version: ", version)
@@ -113,10 +115,11 @@ func service(client *grpc.Client) http.Handler {
 
 	// setup logger middleware
 	logger := httplog.NewLogger("http-relay", httplog.Options{
-		// JSON:             true,
-		LogLevel:       slog.LevelDebug,
-		Concise:        true,
-		RequestHeaders: true,
+		//JSON:           true,
+		LogLevel:        slog.LevelInfo,
+		Concise:         true,
+		RequestHeaders:  true,
+		ResponseHeaders: true,
 		// TimeFieldFormat: time.RFC850,
 		QuietDownRoutes: []string{
 			"/",
@@ -132,10 +135,7 @@ func service(client *grpc.Client) http.Handler {
 
 	// setup panic recoverer to report panics as 500 errors instead of crashing
 	r.Use(middleware.Recoverer)
-	r.Use(TrackRoute)
-
-	// setup our common headers
-	r.Use(AddCommonHeaders)
+	r.Use(trackRoute)
 
 	// login route is a debug route to get a JWT, will need better handling in the future
 	if *requireAuth {
@@ -150,6 +150,8 @@ func service(client *grpc.Client) http.Handler {
 		}
 		r.Use(apiVersionCtx("v2"))
 		r.Route("/v2", func(r chi.Router) {
+			// setup our common headers
+			r.Use(addCommonHeaders)
 			r.Get("/chains", GetChains(client))
 			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/{round:\\d+}", GetBeacon(client))
 
@@ -166,6 +168,8 @@ func service(client *grpc.Client) http.Handler {
 
 	// v1 API
 	r.Group(func(r chi.Router) {
+		// setup our common headers
+		r.Use(addCommonHeaders)
 		// Only 5 requests will be processed at a time (supposedly the caching should handle the others).
 		r.Use(middleware.Throttle(5))
 		r.Use(apiVersionCtx("v1"))
@@ -179,36 +183,39 @@ func service(client *grpc.Client) http.Handler {
 		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/public/{round:\\d+}", GetBeacon(client))
 		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/info", GetInfoV1(client))
 		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/health", GetHealth(client))
-
-		r.Get("/{beaconID}/public/latest", GetLatest(client))
-		r.Get("/{beaconID}/public/{round:\\d+}", GetBeacon(client))
-		r.Get("/{beaconID}/info", GetInfoV1(client))
-		r.Get("/{beaconID}/health", GetHealth(client))
 	})
 
-	walkFunc := func(method string, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error {
-		route = strings.Replace(route, "/*/", "/", -1)
-		fmt.Printf("%s %s\n", method, route)
-		return nil
+	{
+		// we want to print all routes served by our chi router
+		allRoutes := &strings.Builder{}
+		// displays all existing routes in the CLI upon starting or calling /
+		walkFunc := func(method string, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error {
+			route = strings.Replace(route, "/*/", "/", -1)
+			fmt.Fprintf(allRoutes, "%s %s\n", method, route)
+			return nil
+		}
+		if err := chi.Walk(r, walkFunc); err != nil {
+			fmt.Printf("Logging err: %s\n", err.Error())
+		}
+		r.Get("/", DisplayRoutes([]byte(allRoutes.String())))
 	}
 
-	if err := chi.Walk(r, walkFunc); err != nil {
-		fmt.Printf("Logging err: %s\n", err.Error())
-	}
+	// we explicitly don't serve favicon
+	r.Get("/favicon.ico", http.NotFound)
 
 	return r
 }
 
-func TrackRoute(next http.Handler) http.Handler {
+func trackRoute(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		next.ServeHTTP(w, r)
 		rctx := chi.RouteContext(r.Context())
 		routePattern := strings.Join(rctx.RoutePatterns, "")
-		fmt.Println("route:", routePattern)
+		fmt.Println("route used:", routePattern)
 	})
 }
 
-func AddCommonHeaders(next http.Handler) http.Handler {
+func addCommonHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Server", version)
 		w.Header().Set("Content-Type", "application/json")

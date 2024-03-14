@@ -1,5 +1,8 @@
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/drand/drand v1.5.11/go.mod h1:TvJjCJ/s4Usn4pKRpDC0N1QaCwSt3YC8fRqhZdpOUU0=
+github.com/drand/drand/v2 v2.0.5-testnet.0.20240306023503-dc4c1de60df5 h1:wsk6oS5xKUQxHi4Eh64OtFo6gbIxgxKbY85z4brD1+8=
+github.com/drand/drand/v2 v2.0.5-testnet.0.20240306023503-dc4c1de60df5/go.mod h1:EWqDm/81rNMf+F87mJv+O+a8GwYByQTHnbfH+m8q7YU=
 github.com/go-chi/chi/v5 v5.0.11 h1:BnpYbFZ3T3S1WMpD79r7R5ThWX40TaFB7L31Y8xqSwA=
 github.com/go-chi/chi/v5 v5.0.11/go.mod h1:DslCQbL2OYiznFReuXYUmQ2hGd1aDpCnlMNITLSKoi8=
 github.com/go-chi/chi/v5 v5.0.12 h1:9euLV5sTrTNTRUU9POmDUvfxyj6LAABLUcEWO+JJb4s=
