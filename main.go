@@ -35,7 +35,7 @@ func init() {
 	// TODO: consider migrating to AWS secret manager
 	token, provided := os.LookupEnv("AUTH_TOKEN")
 	if !provided || len(token) < 256 {
-		slog.Error("AUTH_TOKEN not set to a 128 byte hex-encoded secret, disabling authenticated API")
+		slog.Warn("AUTH_TOKEN not set to a 128 byte hex-encoded secret, disabling authenticated API")
 		*requireAuth = false
 	} else {
 		var err error
@@ -47,24 +47,23 @@ func init() {
 	}
 }
 
-//var knownChains map[string]chain.Info
-
 func main() {
 	if *goVersion {
 		log.Fatal("drand http server version: ", version)
 	}
 
-	log.Println("Starting with", "grpc", *grpcURL)
 	host, port, err := net.SplitHostPort(*grpcURL)
 	if err != nil {
 		log.Fatal("Unable to parse --grpc flag, please provide a valid one. Err: ", err)
 	}
 
-	log.Println("Starting ", version, " against GRPC node at ", host)
-	client, err := grpc.NewClient(net.JoinHostPort(host, port))
+	slog.Info("Starting http relay", "version", version, "host", host)
+	client, err := grpc.NewClient(net.JoinHostPort(host, port), slog.Default())
 	if err != nil {
-		log.Fatalf("Failed to create client: %s", err)
+		slog.Error("Failed to create client", "error", err)
+		return
 	}
+	defer client.Close()
 
 	// The HTTP Server
 	server := &http.Server{Addr: "0.0.0.0:8080", Handler: service(client)}
@@ -84,7 +83,8 @@ func main() {
 		go func() {
 			<-shutdownCtx.Done()
 			if errors.Is(shutdownCtx.Err(), context.DeadlineExceeded) {
-				log.Fatal("graceful shutdown timed out.. forcing exit.")
+				slog.Error("graceful shutdown timed out.. forcing exit")
+				return
 			}
 			// make sure to cancel early if we can
 			cancel()
@@ -93,20 +93,22 @@ func main() {
 		// Trigger graceful shutdown
 		err := server.Shutdown(shutdownCtx)
 		if err != nil {
-			log.Fatal(err)
+			slog.Error("server Shutdown error", "err", err)
+			return
 		}
 		serverStopCtx()
 	}()
 
 	// Run the server
 	err = server.ListenAndServe()
-	if err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("server error", "err", err)
+		return
 	}
 
 	// Wait for server context to be stopped
 	<-serverCtx.Done()
-	log.Println("drand http server stopped")
+	slog.Info("drand http server stopped")
 }
 
 func service(client *grpc.Client) http.Handler {
@@ -211,7 +213,7 @@ func trackRoute(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		rctx := chi.RouteContext(r.Context())
 		routePattern := strings.Join(rctx.RoutePatterns, "")
-		fmt.Println("route used:", routePattern)
+		slog.Debug("request received", "route", routePattern)
 	})
 }
 

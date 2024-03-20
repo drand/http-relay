@@ -13,6 +13,20 @@ type HexBeacon struct {
 	PreviousSignature HexBytes `json:"previous_signature,omitempty"`
 }
 
+func (h *HexBeacon) GetRound() uint64 {
+	return h.Round
+}
+func (h *HexBeacon) GetRandomness() []byte {
+	return h.Randomness
+}
+
+func (h *HexBeacon) GetSignature() []byte {
+	return h.Signature
+}
+func (h *HexBeacon) GetPreviousSignature() []byte {
+	return h.PreviousSignature
+}
+
 type RandomData interface {
 	GetRound() uint64
 	GetRandomness() []byte
@@ -33,9 +47,12 @@ func NewHexBeacon(beacon RandomData) *HexBeacon {
 // with old store formats
 type HexBytes []byte
 
+func (h *HexBytes) String() string {
+	return hex.EncodeToString(*h)
+}
+
 func (h *HexBytes) MarshalJSON() ([]byte, error) {
-	hexString := hex.EncodeToString(*h)
-	return json.Marshal(hexString)
+	return json.Marshal(h.String())
 }
 
 // UnmarshalJSON converts a hexadecimal string from JSON to a byte slice

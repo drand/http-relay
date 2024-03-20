@@ -6,7 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
+	"log/slog"
 	"os"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -25,7 +25,7 @@ func init() {
 	if !provided {
 		secret = flag.Arg(0)
 	} else {
-		log.Println("Using AUTH_TOKEN var env, ignoring binary arguments")
+		slog.Error("Using AUTH_TOKEN var env, ignoring binary arguments")
 	}
 	if len(secret) < 256 {
 		log.Fatal("AUTH_TOKEN not provided as a 128 byte hex-encoded secret in argument. Got ", len(secret), " char: ", secret)
@@ -49,8 +49,7 @@ func main() {
 	// Create a JWT and send it as response
 	tokenString, err := token.SignedString(jwtSecret)
 	if err != nil {
-		log.Fatal("Error while signing the token", http.StatusInternalServerError)
-		return
+		log.Fatal("Error while signing the token")
 	}
 
 	response := map[string]string{
