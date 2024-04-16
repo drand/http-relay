@@ -20,7 +20,7 @@ func AddAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		slog.Debug("Received JWT authenticated request", authHeader)
+		slog.Debug("Received JWT authenticated request", "headers", authHeader)
 
 		token, err := jwt.Parse(authHeader[1], func(token *jwt.Token) (interface{}, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {

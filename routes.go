@@ -62,33 +62,27 @@ func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			info, err := c.GetChainInfo(r.Context(), m)
 			if err != nil {
 				slog.Error("[GetBeacon] error retrieving chain info", "error", err)
-				// we skip cache-age setting
+				// we skip cache-age setting, something is wrong
 				w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
-			}
-
-			cacheTime, expected, err := NextBeaconTime(info, beacon.Round)
-			if err != nil {
-				w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
-				slog.Error("[GetBeacon] Future beacon was received, unexpected", "latest", beacon.Round, "expected", expected)
 			} else {
-				w.Header().Set("Cache-Control",
-					fmt.Sprintf("public, must-revalidate, max-age=%d", cacheTime))
-				slog.Info("[GetBeacon] StatusOK", "cachetime", cacheTime)
+				cacheTime, expected := info.ExpectedNext()
+				if beacon.Round >= expected {
+					w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+					slog.Error("[GetBeacon] Future beacon was requested, unexpected", "requested", beacon.Round, "expected", expected)
+					// I know, 425 is meant to indicate a replay attack risk, but hey, it's the perfect error name!
+					http.Error(w, "Requested future beacon", http.StatusTooEarly)
+					return
+				} else {
+					w.Header().Set("Cache-Control",
+						fmt.Sprintf("public, must-revalidate, max-age=%d", cacheTime-time.Now().Unix()))
+					slog.Debug("[GetBeacon] StatusOK", "cachetime", cacheTime)
+				}
 			}
 		}
+
 		w.WriteHeader(http.StatusOK)
 		w.Write(json)
 	}
-}
-
-func NextBeaconTime(info *grpc.JsonInfoV2, currentRound uint64) (int64, uint64, error) {
-	p := int64(info.Period)
-	// we rely on integer division rounding down, plus one because round 1 happened at GenesisTime
-	expected := ((time.Now().Unix() - info.GenesisTime) / p) + 1
-	if currentRound >= uint64(expected) {
-		return 0, uint64(expected), fmt.Errorf("outdated round")
-	}
-	return expected*p + info.GenesisTime - time.Now().Unix(), uint64(expected), nil
 }
 
 func GetChains(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
@@ -137,13 +131,7 @@ func GetHealth(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			return
 		}
 
-		_, expected, err := NextBeaconTime(info, latest.Round)
-		if err != nil {
-			slog.Error("NextBeaconTime", "error", err)
-			http.Error(w, "Failed to encode HealthStatus", http.StatusInternalServerError)
-
-		}
-
+		_, expected := info.ExpectedNext()
 		if expected == latest.Round {
 			w.WriteHeader(http.StatusOK)
 		} else {

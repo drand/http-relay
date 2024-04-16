@@ -173,6 +173,13 @@ func NewInfoV2(resp *proto.ChainInfoPacket) *JsonInfoV2 {
 	}
 }
 
+func (info *JsonInfoV2) ExpectedNext() (expectedTime int64, expectedRound uint64) {
+	p := int64(info.Period)
+	// we rely on integer division rounding down, plus one because round 1 happened at GenesisTime
+	expected := ((time.Now().Unix() - info.GenesisTime) / p) + 1
+	return expected*p + info.GenesisTime, uint64(expected)
+}
+
 func (j *JsonInfoV2) V1() *JsonInfoV1 {
 	return &JsonInfoV1{
 		PublicKey:   j.PublicKey,

@@ -27,7 +27,9 @@ var (
 	version     = "drand-http-server-v2.0.1"
 	grpcURL     = flag.String("grpc", "localhost:7001", "The URL and port to your drand node's grpc port, e.g. pl1-rpc.testnet.drand.sh:443")
 	goVersion   = flag.Bool("version", false, "Displays the current server version.")
-	requireAuth = flag.Bool("enable-auth", false, "Forces JWT authentication on V2 API using the JWT secret from .")
+	requireAuth = flag.Bool("enable-auth", false, "Forces JWT authentication on V2 API using the JWT secret from the AUTH_TOKEN env variable.")
+	verbose     = flag.Bool("verbose", false, "Prints as many logs as possible.")
+	jsonFlag    = flag.Bool("json", false, "Prints logs in JSON format.")
 )
 
 func init() {
@@ -114,30 +116,35 @@ func main() {
 func service(client *grpc.Client) http.Handler {
 	// setup chi router
 	r := chi.NewRouter()
-
 	// setup logger middleware
-	logger := httplog.NewLogger("http-relay", httplog.Options{
-		//JSON:           true,
-		LogLevel:        slog.LevelInfo,
-		Concise:         true,
-		RequestHeaders:  true,
-		ResponseHeaders: true,
+	logger := newLogger(httplog.Options{
+		JSON: *jsonFlag,
+		LogLevel: func() slog.Level {
+			if *verbose {
+				return slog.LevelDebug
+			}
+			return slog.LevelWarn
+		}(),
+		Concise:         !(*verbose),
+		ResponseHeaders: *verbose,
 		// TimeFieldFormat: time.RFC850,
-		QuietDownRoutes: []string{
-			"/",
-			"/ping",
-		},
-		QuietDownPeriod: 1 * time.Second,
-		// SourceFieldName: "source",
+		// RequestHeaders:  true, // not supported by our logger
+		// QuietDownRoutes: []string{ // not supported by our logger
+		//	 "/",
+		//	 "/ping",
+		// },
+		// QuietDownPeriod: 1 * time.Second, // not supported by our logger
 	})
-	r.Use(httplog.RequestLogger(logger))
+	r.Use(handleLogger(logger))
 
 	// setup ping endpoint for load balancers and uptime testing, without ACLs
 	r.Use(middleware.Heartbeat("/ping"))
 
 	// setup panic recoverer to report panics as 500 errors instead of crashing
 	r.Use(middleware.Recoverer)
-	r.Use(trackRoute)
+	if *verbose {
+		r.Use(trackRoute)
+	}
 
 	// login route is a debug route to get a JWT, will need better handling in the future
 	if *requireAuth {
@@ -152,34 +159,35 @@ func service(client *grpc.Client) http.Handler {
 		}
 		r.Use(apiVersionCtx("v2"))
 		r.Route("/v2", func(r chi.Router) {
-			// setup our common headers
+			// use our common headers
 			r.Use(addCommonHeaders)
 			r.Get("/chains", GetChains(client))
-			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/{round:\\d+}", GetBeacon(client))
 
-			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/latest", GetLatest(client))
 			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/info", GetInfoV2(client))
 			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/health", GetHealth(client))
+			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/{round:\\d+}", GetBeacon(client))
+			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/latest", GetLatest(client))
 
-			r.Get("/{beaconID}/latest", GetLatest(client))
-			r.Get("/{beaconID}/{round:\\d+}", GetBeacon(client))
 			r.Get("/{beaconID}/info", GetInfoV2(client))
 			r.Get("/{beaconID}/health", GetHealth(client))
+			r.Get("/{beaconID}/{round:\\d+}", GetBeacon(client))
+			r.Get("/{beaconID}/latest", GetLatest(client))
 		})
 	})
 
 	// v1 API
 	r.Group(func(r chi.Router) {
-		// setup our common headers
+		// use our common headers
 		r.Use(addCommonHeaders)
 		// Only 5 requests will be processed at a time (supposedly the caching should handle the others).
 		r.Use(middleware.Throttle(5))
 		r.Use(apiVersionCtx("v1"))
 		r.Get("/chains", GetChains(client))
 		r.Get("/info", GetInfoV1(client))
+		r.Get("/health", GetHealth(client))
+
 		r.Get("/public/latest", GetLatest(client))
 		r.Get("/public/{round:\\d+}", GetBeacon(client))
-		r.Get("/health", GetHealth(client))
 
 		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/public/latest", GetLatest(client))
 		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/public/{round:\\d+}", GetBeacon(client))
@@ -213,7 +221,7 @@ func trackRoute(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		rctx := chi.RouteContext(r.Context())
 		routePattern := strings.Join(rctx.RoutePatterns, "")
-		slog.Debug("request received", "route", routePattern)
+		slog.Debug("request matched", "route", routePattern)
 	})
 }
 
