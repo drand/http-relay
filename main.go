@@ -20,12 +20,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/httplog/v2"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc/resolver"
 )
 
 var (
 	jwtSecret   []byte
 	version     = "drand-http-server-v2.0.1"
-	grpcURL     = flag.String("grpc", "localhost:7001", "The URL and port to your drand node's grpc port, e.g. pl1-rpc.testnet.drand.sh:443")
+	grpcURL     = flag.String("grpc", "localhost:7001", "The URL and port to your drand node's grpc port, e.g. pl1-rpc.testnet.drand.sh:443 you can add fallback nodes by separating them with a comma: pl1-rpc.testnet.drand.sh:443,pl2-rpc.testnet.drand.sh:443")
 	goVersion   = flag.Bool("version", false, "Displays the current server version.")
 	requireAuth = flag.Bool("enable-auth", false, "Forces JWT authentication on V2 API using the JWT secret from the AUTH_TOKEN env variable.")
 	verbose     = flag.Bool("verbose", false, "Prints as many logs as possible.")
@@ -54,18 +56,27 @@ func main() {
 		log.Fatal("drand http server version: ", version)
 	}
 
-	host, port, err := net.SplitHostPort(*grpcURL)
-	if err != nil {
-		log.Fatal("Unable to parse --grpc flag, please provide a valid one. Err: ", err)
+	nodesAddr := strings.Split(*grpcURL, ",")
+	for _, nodeAdd := range nodesAddr {
+		_, _, err := net.SplitHostPort(nodeAdd)
+		if err != nil {
+			log.Fatalf("Unable to parse --grpc flag correctly, please provide valid node URLs. On %q, got err: %v", nodeAdd, err)
+		}
 	}
+	resolver.Register(&grpc.FallbackResolver{})
 
-	slog.Info("Starting http relay", "version", version, "host", host)
-	client, err := grpc.NewClient(net.JoinHostPort(host, port), slog.Default())
+	client, err := grpc.NewClient("fallback:"+*grpcURL, slog.Default())
 	if err != nil {
-		slog.Error("Failed to create client", "error", err)
-		return
+		log.Fatal("Failed to create client", "address", nodesAddr, "error", err)
 	}
 	defer client.Close()
+
+	// register client metrics
+	ClientMetrics.Register(client.GetMetrics())
+
+	go serveMetrics()
+
+	slog.Info("Starting http relay", "version", version, "client", client)
 
 	// The HTTP Server
 	server := &http.Server{Addr: "0.0.0.0:8080", Handler: service(client)}
@@ -88,13 +99,12 @@ func main() {
 				slog.Error("graceful shutdown timed out.. forcing exit")
 				return
 			}
-			// make sure to cancel early if we can
+			// make sure to cancel context otherwise
 			cancel()
 		}()
 
 		// Trigger graceful shutdown
-		err := server.Shutdown(shutdownCtx)
-		if err != nil {
+		if err := server.Shutdown(shutdownCtx); err != nil {
 			slog.Error("server Shutdown error", "err", err)
 			return
 		}
@@ -113,9 +123,24 @@ func main() {
 	slog.Info("drand http server stopped")
 }
 
+func prometheusMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fn := promhttp.InstrumentHandlerCounter(
+			HTTPCallCounter,
+			promhttp.InstrumentHandlerDuration(
+				HTTPLatency,
+				promhttp.InstrumentHandlerInFlight(
+					HTTPInFlight,
+					next)))
+		fn.ServeHTTP(w, r)
+	})
+}
+
 func service(client *grpc.Client) http.Handler {
 	// setup chi router
 	r := chi.NewRouter()
+	// putting our metric middleware first to get timing right
+	r.Use(prometheusMiddleware)
 	// setup logger middleware
 	logger := newLogger(httplog.Options{
 		JSON: *jsonFlag,
@@ -135,25 +160,18 @@ func service(client *grpc.Client) http.Handler {
 		// },
 		// QuietDownPeriod: 1 * time.Second, // not supported by our logger
 	})
-	r.Use(handleLogger(logger))
+	r.Use(handleLogger(logger)) // also setups Request ID and Panic recoverer
 
 	// setup ping endpoint for load balancers and uptime testing, without ACLs
 	r.Use(middleware.Heartbeat("/ping"))
 
-	// setup panic recoverer to report panics as 500 errors instead of crashing
-	r.Use(middleware.Recoverer)
 	if *verbose {
 		r.Use(trackRoute)
 	}
 
-	// login route is a debug route to get a JWT, will need better handling in the future
-	if *requireAuth {
-		r.Get("/login", GetJWT)
-	}
-
 	// v2 with ACL protected routes with shared grpc client
 	r.Group(func(r chi.Router) {
-		// JWT authentication
+		// JWT authentication, tokens to be issued using the jwtissuer binary
 		if *requireAuth {
 			r.Use(AddAuth)
 		}

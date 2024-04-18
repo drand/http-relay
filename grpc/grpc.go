@@ -8,11 +8,15 @@ import (
 	"sync"
 	"time"
 
+	proto "github.com/drand/drand/v2/protobuf/drand"
+	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/timeout"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
-
-	proto "github.com/drand/drand/v2/protobuf/drand"
 )
 
 type logger interface {
@@ -30,6 +34,7 @@ type Client struct {
 	serverAddr  string
 	knownChains sync.Map
 	timeout     time.Duration
+	metrics     *grpcprom.ClientMetrics
 	log         logger
 }
 
@@ -38,7 +43,25 @@ type Client struct {
 func NewClient(serverAddr string, l logger) (*Client, error) {
 	l.Debug("NewClient", "serverAddr", serverAddr)
 
-	conn, err := grpc.Dial(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// setup metrics
+	clMetrics := grpcprom.NewClientMetrics(
+		grpcprom.WithClientHandlingTimeHistogram(
+			grpcprom.WithHistogramBuckets([]float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 2, 3, 6, 20, 30}),
+		),
+	)
+
+	conn, err := grpc.Dial(serverAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(
+			timeout.TimeoutUnaryClientInterceptor(500*time.Millisecond),
+			clMetrics.UnaryClientInterceptor(),
+			nodeInterceptor,
+		),
+		grpc.WithChainStreamInterceptor(
+			clMetrics.StreamClientInterceptor(),
+		),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+	)
 	if err != nil {
 		l.Error("Unable to Dial", "err", err)
 	}
@@ -46,6 +69,7 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		conn:       conn,
 		serverAddr: serverAddr,
 		timeout:    3 * time.Second,
+		metrics:    clMetrics,
 		log:        l,
 	}
 	// we do a GetChains call to pre-populate the knownChains with a special timeout of 1 minute
@@ -53,6 +77,30 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	defer cancel()
 	_, err = client.GetChains(ctx)
 	return client, err
+}
+
+var (
+	RequestsCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "grpc_client_requests_per_backend",
+			Help: "The total number of requests done per backend node",
+		},
+		[]string{"node"},
+	)
+)
+
+func nodeInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	//node := cc.GetState()
+	//panic(ctx)
+	// Increment the counter for the node
+	//RequestsCounter.With(prometheus.Labels{"node": node}).Inc()
+
+	// Forward the call to the actual gRPC client
+	return invoker(ctx, method, req, reply, cc, opts...)
+}
+
+func (c *Client) GetMetrics() *grpcprom.ClientMetrics {
+	return c.metrics
 }
 
 // SetTimeout allows to set your own timeout for GRPC health checks.
@@ -282,4 +330,8 @@ func (c *Client) GetChains(ctx context.Context) ([]string, error) {
 	}
 
 	return chains, err
+}
+
+func (c *Client) String() string {
+	return c.serverAddr
 }

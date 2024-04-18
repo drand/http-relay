@@ -41,11 +41,33 @@ func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			return
 		}
 
+		info, err := c.GetChainInfo(r.Context(), m)
+		if err != nil {
+			slog.Error("[GetBeacon] error retrieving chain info from primary client", "error", err)
+			// we will skip cache-age setting, something is wrong
+			w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+		}
+
+		nextTime, nextRound := info.ExpectedNext()
+		if round >= nextRound+1 { // never happens when fetching latest because round == 0
+			w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+			slog.Error("[GetBeacon] Future beacon was requested, unexpected", "requested", round, "expected", nextRound, "from", r.RemoteAddr)
+			// I know, 425 is meant to indicate a replay attack risk, but hey, it's the perfect error name!
+			http.Error(w, "Requested future beacon", http.StatusTooEarly)
+			return
+		} else if round == nextRound {
+			// we wait until the round is supposed to be emitted, minus 10 ms to account for network latency anyway
+			time.Sleep(time.Duration(nextTime-time.Now().Unix())*time.Second - 10*time.Millisecond)
+		}
+
 		beacon, err := c.GetBeacon(r.Context(), m, round)
 		if err != nil {
-			w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
-			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
-			return
+			if err != nil {
+				slog.Error("all clients are unable to provide beacons", "error", err)
+				w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
+				return
+			}
 		}
 
 		json, err := json.Marshal(beacon)
@@ -59,25 +81,14 @@ func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			// i.e. we're not fetching latest, we can store these beacons for a long time
 			w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 		} else {
-			info, err := c.GetChainInfo(r.Context(), m)
-			if err != nil {
-				slog.Error("[GetBeacon] error retrieving chain info", "error", err)
-				// we skip cache-age setting, something is wrong
-				w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
-			} else {
-				cacheTime, expected := info.ExpectedNext()
-				if beacon.Round >= expected {
-					w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
-					slog.Error("[GetBeacon] Future beacon was requested, unexpected", "requested", beacon.Round, "expected", expected)
-					// I know, 425 is meant to indicate a replay attack risk, but hey, it's the perfect error name!
-					http.Error(w, "Requested future beacon", http.StatusTooEarly)
-					return
-				} else {
-					w.Header().Set("Cache-Control",
-						fmt.Sprintf("public, must-revalidate, max-age=%d", cacheTime-time.Now().Unix()))
-					slog.Debug("[GetBeacon] StatusOK", "cachetime", cacheTime)
-				}
+			cacheTime := nextTime - time.Now().Unix()
+			if cacheTime < 0 {
+				cacheTime = 0
 			}
+			// we're fetching latest we need to stop caching in time for the next round
+			w.Header().Set("Cache-Control",
+				fmt.Sprintf("public, must-revalidate, max-age=%d", cacheTime))
+			slog.Debug("[GetBeacon] StatusOK", "cachetime", cacheTime)
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -89,9 +100,11 @@ func GetChains(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		chains, err := c.GetChains(r.Context())
 		if err != nil {
-			slog.Error("failed to get chains", "error", err)
-			http.Error(w, "Failed to get chains", http.StatusInternalServerError)
-			return
+			if err != nil {
+				slog.Error("failed to get chains from all clients", "error", err)
+				http.Error(w, "Failed to get chains", http.StatusInternalServerError)
+				return
+			}
 		}
 
 		json, err := json.Marshal(chains)
@@ -164,9 +177,11 @@ func GetInfoV1(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 		chains, err := c.GetChainInfo(r.Context(), m)
 		if err != nil {
-			slog.Error("failed to get ChainInfo", "error", err)
-			http.Error(w, "Failed to get ChainInfo", http.StatusInternalServerError)
-			return
+			if err != nil {
+				slog.Error("failed to get ChainInfo from all clients", "error", err)
+				http.Error(w, "Failed to get ChainInfo", http.StatusInternalServerError)
+				return
+			}
 		}
 
 		json, err := json.Marshal(chains.V1())
@@ -191,9 +206,11 @@ func GetInfoV2(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 		chains, err := c.GetChainInfo(r.Context(), m)
 		if err != nil {
-			slog.Error("failed to get ChainInfo", "error", err)
-			http.Error(w, "Failed to get ChainInfo", http.StatusInternalServerError)
-			return
+			if err != nil {
+				slog.Error("failed to get ChainInfo", "error", err)
+				http.Error(w, "Failed to get ChainInfo", http.StatusInternalServerError)
+				return
+			}
 		}
 
 		json, err := json.Marshal(chains)
@@ -218,9 +235,11 @@ func GetLatest(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 		beacon, err := c.GetBeacon(r.Context(), m, 0)
 		if err != nil {
-			slog.Error("unable to get beacon from grpc client", "error", err)
-			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
-			return
+			if err != nil {
+				slog.Error("unable to get beacon from any grpc client", "error", err)
+				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
+				return
+			}
 		}
 
 		json, err := json.Marshal(beacon)
