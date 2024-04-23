@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/drand/drand/v2/common"
 	proto "github.com/drand/drand/v2/protobuf/drand"
 	"github.com/drand/http-server/grpc"
 	"github.com/go-chi/chi/v5"
@@ -257,18 +258,22 @@ func createRequestMD(r *http.Request) (*proto.Metadata, error) {
 	chainhash := chi.URLParam(r, "chainhash")
 	beaconID := chi.URLParam(r, "beaconID")
 
+	// handling the default case
 	if chainhash == "" && beaconID == "" {
-		return &proto.Metadata{BeaconID: "default"}, nil
+		return &proto.Metadata{BeaconID: common.DefaultBeaconID}, nil
 	}
 
+	// warning when unusal request is built
 	if len(chainhash) == 64 && beaconID != "" {
 		slog.Warn("[createRequestMD] unexpectedly, createRequestMD got both a chainhash and a beaconID. Ignoring beaconID")
 	}
 
+	// handling the beacon ID case
 	if beaconID != "" && chainhash == "" {
 		return &proto.Metadata{BeaconID: beaconID}, nil
 	}
 
+	// handling the chain hash case
 	hash, err := hex.DecodeString(chainhash)
 	if err != nil {
 		slog.Error("[createRequestMD] error decoding hex", "chainhash", chainhash, "error", err)

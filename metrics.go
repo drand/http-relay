@@ -117,9 +117,11 @@ func serveMetrics() {
 		EnableOpenMetrics: true,
 	})
 
-	slog.Info("serving metrics at localhost:9999/metrics")
-	http.Handle("/metrics", handler)
-
+	slog.Info("starting to serve metrics on localhost:9999/metrics")
+	http.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slog.Debug("serving metrics on localhost:9999/metrics")
+		handler.ServeHTTP(w, r)
+	}))
 	err := http.ListenAndServe(":9999", nil) //nolint:gosec // Ignoring G114
 	if err != nil {
 		log.Fatalf("error serving http: %v", err)

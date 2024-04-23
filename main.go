@@ -21,7 +21,6 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/httplog/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"google.golang.org/grpc/resolver"
 )
 
 var (
@@ -49,6 +48,7 @@ func init() {
 			*requireAuth = false
 		}
 	}
+	slog.SetLogLoggerLevel(getLogLevel())
 }
 
 func main() {
@@ -63,9 +63,8 @@ func main() {
 			log.Fatalf("Unable to parse --grpc flag correctly, please provide valid node URLs. On %q, got err: %v", nodeAdd, err)
 		}
 	}
-	resolver.Register(&grpc.FallbackResolver{})
 
-	client, err := grpc.NewClient("fallback:"+*grpcURL, slog.Default())
+	client, err := grpc.NewClient("fallback:///"+*grpcURL, slog.Default())
 	if err != nil {
 		log.Fatal("Failed to create client", "address", nodesAddr, "error", err)
 	}
@@ -143,13 +142,8 @@ func service(client *grpc.Client) http.Handler {
 	r.Use(prometheusMiddleware)
 	// setup logger middleware
 	logger := newLogger(httplog.Options{
-		JSON: *jsonFlag,
-		LogLevel: func() slog.Level {
-			if *verbose {
-				return slog.LevelDebug
-			}
-			return slog.LevelWarn
-		}(),
+		JSON:            *jsonFlag,
+		LogLevel:        getLogLevel(),
 		Concise:         !(*verbose),
 		ResponseHeaders: *verbose,
 		// TimeFieldFormat: time.RFC850,
@@ -259,4 +253,11 @@ func apiVersionCtx(version string) func(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func getLogLevel() slog.Level {
+	if *verbose {
+		return slog.LevelDebug
+	}
+	return slog.LevelWarn
 }

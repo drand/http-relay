@@ -5,19 +5,24 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	proto "github.com/drand/drand/v2/protobuf/drand"
 	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/timeout"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/credentials/insecure"
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 )
+
+func init() {
+	// registers the logging_pick_first balancer
+	balancer.Register(NewLoggingBalancerBuilder("pick_first", slog.With("service", "balancer")))
+}
 
 type logger interface {
 	Error(msg string, args ...any)
@@ -51,11 +56,11 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	)
 
 	conn, err := grpc.Dial(serverAddr,
+		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
 			timeout.TimeoutUnaryClientInterceptor(500*time.Millisecond),
 			clMetrics.UnaryClientInterceptor(),
-			nodeInterceptor,
 		),
 		grpc.WithChainStreamInterceptor(
 			clMetrics.StreamClientInterceptor(),
@@ -77,26 +82,6 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	defer cancel()
 	_, err = client.GetChains(ctx)
 	return client, err
-}
-
-var (
-	RequestsCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "grpc_client_requests_per_backend",
-			Help: "The total number of requests done per backend node",
-		},
-		[]string{"node"},
-	)
-)
-
-func nodeInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-	//node := cc.GetState()
-	//panic(ctx)
-	// Increment the counter for the node
-	//RequestsCounter.With(prometheus.Labels{"node": node}).Inc()
-
-	// Forward the call to the actual gRPC client
-	return invoker(ctx, method, req, reply, cc, opts...)
 }
 
 func (c *Client) GetMetrics() *grpcprom.ClientMetrics {
@@ -252,14 +237,15 @@ func (j *JsonInfoV1) V2() *JsonInfoV2 {
 	}
 }
 
-// GetChainInfo returns the chain info for the requested chainhash or beacon ID in the provided Metadata
+// GetChainInfo returns the chain info for the requested chainhash or beacon ID in the provided Metadata, the Metadata
+// should specify either a beacon ID or a chain hash, not both in order to benefit from in chain info caching.
 func (c *Client) GetChainInfo(ctx context.Context, m *proto.Metadata) (*JsonInfoV2, error) {
 	c.log.Debug("Client GetChainInfo")
 
-	if info, ok := c.knownChains.Load(hex.EncodeToString(m.GetChainHash())); ok {
+	// typically either chain hash or beacon id are set, not both, unless the API is misused
+	if info, ok := c.knownChains.Load(hex.EncodeToString(m.GetChainHash()) + m.GetBeaconID()); ok {
 		res, ok := info.(*JsonInfoV2)
 		if ok {
-			c.log.Debug("Client GetChainInfo knownChains", "cache", "HIT")
 			return res, nil
 		}
 		c.log.Error("Client GetChainInfo: unexpected non-JsonInfoV2 content in map", "res", res)
@@ -280,6 +266,10 @@ func (c *Client) GetChainInfo(ctx context.Context, m *proto.Metadata) (*JsonInfo
 
 	info := NewInfoV2(resp)
 	c.knownChains.Store(info.Hash.String(), info)
+
+	// we also have a shortcut for handling beacon IDs, which relies on the fact that we expect either chain hash
+	// or beacon ID in metadata, not both.
+	c.knownChains.Store(info.BeaconId, info)
 
 	return info, err
 }
@@ -327,6 +317,9 @@ func (c *Client) GetChains(ctx context.Context) ([]string, error) {
 			return nil, fmt.Errorf("invalid chainhash %q for chain %q", hash, chain)
 		}
 		c.knownChains.Store(strChain, NewInfoV2(info))
+		if id := info.GetMetadata().GetBeaconID(); id != "" {
+			c.knownChains.Store(id, NewInfoV2(info))
+		}
 	}
 
 	return chains, err
