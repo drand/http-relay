@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/resolver"
 )
 
@@ -37,8 +38,8 @@ func (r *FallbackResolver) start() error {
 	addrStrs := strings.Split(r.target.Endpoint(), ",")
 	addrs := make([]resolver.Address, len(addrStrs))
 	for i, a := range addrStrs {
-		slog.Info("Adding backend address to pool", "host", a)
-		addrs[i] = resolver.Address{Addr: a, ServerName: a}
+		slog.Info("Adding backend address to pool", "host", a, "order", i)
+		addrs[i] = resolver.Address{Addr: a, ServerName: a, Attributes: attributes.New("order", i)}
 	}
 	// If a resolver sets Addresses but does not set Endpoints, one Endpoint
 	// will be created for each Address before the State is passed to the LB

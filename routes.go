@@ -254,6 +254,12 @@ func GetLatest(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	}
 }
 
+func GetChanz(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(c.GetChanz()))
+	}
+}
+
 func createRequestMD(r *http.Request) (*proto.Metadata, error) {
 	chainhash := chi.URLParam(r, "chainhash")
 	beaconID := chi.URLParam(r, "beaconID")

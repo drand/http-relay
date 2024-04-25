@@ -72,13 +72,12 @@ func main() {
 
 	// register client metrics
 	ClientMetrics.Register(client.GetMetrics())
-
 	go serveMetrics()
 
 	slog.Info("Starting http relay", "version", version, "client", client)
 
 	// The HTTP Server
-	server := &http.Server{Addr: "0.0.0.0:8080", Handler: service(client)}
+	server := &http.Server{Addr: "0.0.0.0:8080", Handler: setup(client)}
 
 	// Server run context
 	serverCtx, serverStopCtx := context.WithCancel(context.Background())
@@ -135,7 +134,7 @@ func prometheusMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func service(client *grpc.Client) http.Handler {
+func setup(client *grpc.Client) http.Handler {
 	// setup chi router
 	r := chi.NewRouter()
 	// putting our metric middleware first to get timing right
@@ -163,6 +162,8 @@ func service(client *grpc.Client) http.Handler {
 		r.Use(trackRoute)
 	}
 
+	r.Get("/chanz", GetChanz(client))
+
 	// v2 with ACL protected routes with shared grpc client
 	r.Group(func(r chi.Router) {
 		// JWT authentication, tokens to be issued using the jwtissuer binary
@@ -184,6 +185,7 @@ func service(client *grpc.Client) http.Handler {
 			r.Get("/{beaconID}/health", GetHealth(client))
 			r.Get("/{beaconID}/{round:\\d+}", GetBeacon(client))
 			r.Get("/{beaconID}/latest", GetLatest(client))
+
 		})
 	})
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"log/slog"
 	"net/http"
 
@@ -124,7 +123,7 @@ func serveMetrics() {
 	}))
 	err := http.ListenAndServe(":9999", nil) //nolint:gosec // Ignoring G114
 	if err != nil {
-		log.Fatalf("error serving http: %v", err)
+		slog.Error("error serving http: %v", err)
 		return
 	}
 }

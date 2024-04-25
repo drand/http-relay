@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"log"
 	"log/slog"
+	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,13 +19,17 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/channelz/grpc_channelz_v1"
+	"google.golang.org/grpc/channelz/service"
 	"google.golang.org/grpc/credentials/insecure"
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/protoadapt"
 )
 
 func init() {
-	// registers the logging_pick_first balancer
-	balancer.Register(NewLoggingBalancerBuilder("pick_first", slog.With("service", "balancer")))
+	// registers the logging_pick_first_with_fallback balancer
+	balancer.Register(NewLoggingBalancerBuilder("pick_first_with_fallback", slog.With("service", "balancer")))
 }
 
 type logger interface {
@@ -56,7 +64,7 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	)
 
 	conn, err := grpc.Dial(serverAddr,
-		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first"}`),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first_with_fallback"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
 			timeout.TimeoutUnaryClientInterceptor(500*time.Millisecond),
@@ -77,15 +85,72 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		metrics:    clMetrics,
 		log:        l,
 	}
-	// we do a GetChains call to pre-populate the knownChains with a special timeout of 1 minute
-	ctx, cancel := context.WithTimeout(context.Background(), client.timeout)
-	defer cancel()
-	_, err = client.GetChains(ctx)
+
+	// spin out a channelz server
+	go func() {
+		metricServer := grpc.NewServer()
+		service.RegisterChannelzServiceToServer(metricServer)
+		lis, err := net.Listen("tcp", "127.0.0.1:5555")
+		if err != nil {
+			log.Fatalf("failed to listen: %v", err)
+		}
+		if err := metricServer.Serve(lis); err != nil {
+			slog.Error("error listening on metric server", "err", err)
+			log.Fatalf("failed to serve: %v", err)
+		}
+	}()
+
+	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms timeout built-in above
+	_, err = client.GetChains(context.Background())
 	return client, err
 }
 
 func (c *Client) GetMetrics() *grpcprom.ClientMetrics {
 	return c.metrics
+}
+
+func (c *Client) GetChanz() string {
+	cc, err := grpc.Dial("127.0.0.1:5555", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		slog.Error("Error building channelz client", "err", err)
+		return "Error building channelz client"
+	}
+	client := grpc_channelz_v1.NewChannelzClient(cc)
+	resp, err := client.GetTopChannels(context.Background(), &grpc_channelz_v1.GetTopChannelsRequest{})
+	if err != nil {
+		slog.Error("Error GetTopChannels", "err", err)
+		return "Error GetTopChannels"
+	}
+
+	var strRet string
+
+	var r *grpc_channelz_v1.GetChannelResponse
+	for _, ch := range resp.GetChannel() {
+		if strings.HasPrefix(ch.Ref.GetName(), "fallback") {
+			strRet += ToJSON(ch)
+			r, err = client.GetChannel(context.Background(), &grpc_channelz_v1.GetChannelRequest{ChannelId: ch.Ref.GetChannelId()})
+			if err != nil {
+				slog.Error("Error GetChannel", "err", err)
+				return "Error GetChannel"
+			}
+			break
+		}
+	}
+
+	strRet += ToJSON(r)
+
+	subChannels := r.GetChannel().GetSubchannelRef()
+	ret := make([]*grpc_channelz_v1.GetSubchannelResponse, 0, len(subChannels))
+	for _, sc := range subChannels {
+		subr, err := client.GetSubchannel(context.Background(), &grpc_channelz_v1.GetSubchannelRequest{SubchannelId: sc.GetSubchannelId()})
+		if err != nil {
+			slog.Error("Error GetChannel", "err", err)
+			return "Error GetChannel"
+		}
+		ret = append(ret, subr)
+	}
+
+	return strRet + ToJSON(ret)
 }
 
 // SetTimeout allows to set your own timeout for GRPC health checks.
@@ -327,4 +392,48 @@ func (c *Client) GetChains(ctx context.Context) ([]string, error) {
 
 func (c *Client) String() string {
 	return c.serverAddr
+}
+
+const jsonIndent = "  "
+
+// ToJSON marshals the input into a json string.
+//
+// If marshal fails, it falls back to fmt.Sprintf("%+v").
+func ToJSON(e any) string {
+	if ee, ok := e.(protoadapt.MessageV1); ok {
+		e = protoadapt.MessageV2Of(ee)
+	}
+
+	if ee, ok := e.(protoadapt.MessageV2); ok {
+		mm := protojson.MarshalOptions{
+			Indent:    jsonIndent,
+			Multiline: true,
+		}
+		ret, err := mm.Marshal(ee)
+		if err != nil {
+			// This may fail for proto.Anys, e.g. for xDS v2, LDS, the v2
+			// messages are not imported, and this will fail because the message
+			// is not found.
+			return fmt.Sprintf("%+v", ee)
+		}
+		return string(ret)
+	}
+
+	ret, err := json.MarshalIndent(e, "", jsonIndent)
+	if err != nil {
+		return fmt.Sprintf("%+v", e)
+	}
+	return string(ret)
+}
+
+// FormatJSON formats the input json bytes with indentation.
+//
+// If Indent fails, it returns the unchanged input as string.
+func FormatJSON(b []byte) string {
+	var out bytes.Buffer
+	err := json.Indent(&out, b, "", jsonIndent)
+	if err != nil {
+		return string(b)
+	}
+	return out.String()
 }

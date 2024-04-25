@@ -5,8 +5,6 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
-const loggingBalancerName = "logging_balancer"
-
 type loggingBalancerBuilder struct {
 	sub string
 	log logger
@@ -20,10 +18,12 @@ func NewLoggingBalancerBuilder(balancerName string, l logger) balancer.Builder {
 }
 
 func (b *loggingBalancerBuilder) Build(cc balancer.ClientConn, opt balancer.BuildOptions) balancer.Balancer {
-	//b.log.Info("building logging balancer", "sub-balancer", b.sub, "connTarget", cc.Target(), "BuildOptions Target", opt.Target.String())
+	b.log.Info("building logging balancer", "sub-balancer", b.sub, "connTarget", cc.Target(), "BuildOptions Target", opt.Target.String())
 	return &loggingBalancer{sub: balancer.Get(b.sub).Build(&wrappedClientConn{cc, cc.Target(), b.log}, opt), log: b.log}
 }
 
+// Name will return the name of the underlying balancer used during registration with NewLoggingBalancerBuilder,
+// prepended with "logging_".
 func (b *loggingBalancerBuilder) Name() string {
 	return "logging_" + b.sub
 }
@@ -34,21 +34,24 @@ type loggingBalancer struct {
 }
 
 func (b *loggingBalancer) UpdateClientConnState(in balancer.ClientConnState) error {
-	b.log.Info("updating logging balancer", "state", in.ResolverState)
-	return b.sub.UpdateClientConnState(in)
+	b.log.Info("UpdateClientConnState start", "address_len", len(in.ResolverState.Addresses))
+	err := b.sub.UpdateClientConnState(in)
+	b.log.Info("UpdateClientConnState end", "err", err)
+	return err
 }
+
 func (b *loggingBalancer) ResolverError(err error) {
-	b.log.Error("balancer resolver error", err)
+	b.log.Error("ResolverError", "err", err)
 	b.sub.ResolverError(err)
 }
 
 func (b *loggingBalancer) UpdateSubConnState(cc balancer.SubConn, state balancer.SubConnState) {
-	b.log.Info("balancer update sub conn state", "state", state.ConnectivityState.String())
+	b.log.Info("UpdateSubConnState", "state", state.ConnectivityState.String())
 	b.sub.UpdateSubConnState(cc, state)
 }
 
 func (b *loggingBalancer) Close() {
-	b.log.Info("balancer Close called")
+	b.log.Info("Close")
 	b.sub.Close()
 }
 
@@ -59,7 +62,7 @@ type logPicker struct {
 
 func (p *logPicker) Pick(i balancer.PickInfo) (balancer.PickResult, error) {
 	result, err := p.sub.Pick(i)
-	p.log.Info("pick chose", "endpoint", result.SubConn, "metadata", result.Metadata, "rpc", i.FullMethodName)
+	p.log.Info("Pick", "endpoint", result.SubConn, "metadata", result.Metadata, "rpc", i.FullMethodName)
 	return result, err
 }
 
@@ -85,6 +88,7 @@ func (w *wrappedClientConn) UpdateState(s balancer.State) {
 }
 
 func (w *wrappedClientConn) NewSubConn(addrs []resolver.Address, opts balancer.NewSubConnOptions) (balancer.SubConn, error) {
+	// in a future release, NewSubConn will only support a single address, so let's make sure we do that already.
 	addr := addrs[0]
 	w.log.Warn("NewSubConn called", "addrs", len(addrs), "first", addr)
 	nOpts := balancer.NewSubConnOptions{
@@ -97,6 +101,8 @@ func (w *wrappedClientConn) NewSubConn(addrs []resolver.Address, opts balancer.N
 	}
 	sb, err := w.ClientConn.NewSubConn([]resolver.Address{addr}, nOpts)
 	if err != nil {
+		w.log.Error("NewSubConn errored", "err", err)
+
 		return sb, err
 	}
 	return sb, err
