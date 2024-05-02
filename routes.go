@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"github.com/drand/http-server/grpc"
 	"github.com/go-chi/chi/v5"
 )
+
+var FrontrunTiming time.Duration
 
 func DisplayRoutes(allRoutes []byte) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, _ *http.Request) {
@@ -57,8 +60,8 @@ func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			http.Error(w, "Requested future beacon", http.StatusTooEarly)
 			return
 		} else if round == nextRound {
-			// we wait until the round is supposed to be emitted, minus 10 ms to account for network latency anyway
-			time.Sleep(time.Duration(nextTime-time.Now().Unix())*time.Second - 10*time.Millisecond)
+			// we wait until the round is supposed to be emitted, minus frontrun to account for network latency anyway
+			time.Sleep(time.Duration(nextTime-time.Now().Unix())*time.Second - FrontrunTiming)
 		}
 
 		beacon, err := c.GetBeacon(r.Context(), m, round)
@@ -134,18 +137,30 @@ func GetHealth(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 		latest, err := c.GetBeacon(r.Context(), m, 0)
 		if err != nil {
 			slog.Error("[GetHealth] failed to get latest beacon", "error", err)
-			http.Error(w, "Failed to get latest beacon", http.StatusInternalServerError)
+			http.Error(w, "Failed to get latest beacon for health", http.StatusInternalServerError)
 			return
 		}
 
 		info, err := c.GetChainInfo(r.Context(), m)
 		if err != nil {
 			slog.Error("[GetHealth] failed to get chain info", "error", err)
-			http.Error(w, "Failed to get info", http.StatusInternalServerError)
+			http.Error(w, "Failed to get chain info for health", http.StatusInternalServerError)
 			return
 		}
 
 		_, expected := info.ExpectedNext()
+		if expected != latest.Round {
+			// we force a retry with another backend if we see a discrepancy in case that backend is stuck in a sync
+			slog.Debug("GetHealth forcing retry with other SubConn")
+			ctx := context.WithValue(r.Context(), grpc.SkipCtxKey{}, 1)
+			latest, err = c.GetBeacon(ctx, m, 0)
+			if err != nil {
+				slog.Error("[GetHealth] failed to get latest beacon", "error", err)
+				http.Error(w, "Failed to get latest beacon for health", http.StatusInternalServerError)
+				return
+			}
+		}
+
 		if expected == latest.Round {
 			w.WriteHeader(http.StatusOK)
 		} else {
@@ -256,7 +271,7 @@ func GetLatest(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 func GetChanz(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(c.GetChanz()))
+		w.Write([]byte(grpc.UpdateMetrics()))
 	}
 }
 

@@ -6,10 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"log/slog"
-	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,8 +16,6 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
-	"google.golang.org/grpc/channelz/grpc_channelz_v1"
-	"google.golang.org/grpc/channelz/service"
 	"google.golang.org/grpc/credentials/insecure"
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -44,6 +39,7 @@ type logger interface {
 // is used for health checks only currently.
 type Client struct {
 	conn        *grpc.ClientConn
+	pc          proto.PublicClient
 	serverAddr  string
 	knownChains sync.Map
 	timeout     time.Duration
@@ -67,7 +63,7 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first_with_fallback"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
-			timeout.TimeoutUnaryClientInterceptor(500*time.Millisecond),
+			timeout.UnaryClientInterceptor(500*time.Millisecond),
 			clMetrics.UnaryClientInterceptor(),
 		),
 		grpc.WithChainStreamInterceptor(
@@ -80,25 +76,14 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	}
 	client := &Client{
 		conn:       conn,
+		pc:         proto.NewPublicClient(conn),
 		serverAddr: serverAddr,
 		timeout:    3 * time.Second,
 		metrics:    clMetrics,
 		log:        l,
 	}
 
-	// spin out a channelz server
-	go func() {
-		metricServer := grpc.NewServer()
-		service.RegisterChannelzServiceToServer(metricServer)
-		lis, err := net.Listen("tcp", "127.0.0.1:5555")
-		if err != nil {
-			log.Fatalf("failed to listen: %v", err)
-		}
-		if err := metricServer.Serve(lis); err != nil {
-			slog.Error("error listening on metric server", "err", err)
-			log.Fatalf("failed to serve: %v", err)
-		}
-	}()
+	go startMonitoringServer("127.0.0.1:7555")
 
 	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms timeout built-in above
 	_, err = client.GetChains(context.Background())
@@ -107,50 +92,6 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 
 func (c *Client) GetMetrics() *grpcprom.ClientMetrics {
 	return c.metrics
-}
-
-func (c *Client) GetChanz() string {
-	cc, err := grpc.Dial("127.0.0.1:5555", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		slog.Error("Error building channelz client", "err", err)
-		return "Error building channelz client"
-	}
-	client := grpc_channelz_v1.NewChannelzClient(cc)
-	resp, err := client.GetTopChannels(context.Background(), &grpc_channelz_v1.GetTopChannelsRequest{})
-	if err != nil {
-		slog.Error("Error GetTopChannels", "err", err)
-		return "Error GetTopChannels"
-	}
-
-	var strRet string
-
-	var r *grpc_channelz_v1.GetChannelResponse
-	for _, ch := range resp.GetChannel() {
-		if strings.HasPrefix(ch.Ref.GetName(), "fallback") {
-			strRet += ToJSON(ch)
-			r, err = client.GetChannel(context.Background(), &grpc_channelz_v1.GetChannelRequest{ChannelId: ch.Ref.GetChannelId()})
-			if err != nil {
-				slog.Error("Error GetChannel", "err", err)
-				return "Error GetChannel"
-			}
-			break
-		}
-	}
-
-	strRet += ToJSON(r)
-
-	subChannels := r.GetChannel().GetSubchannelRef()
-	ret := make([]*grpc_channelz_v1.GetSubchannelResponse, 0, len(subChannels))
-	for _, sc := range subChannels {
-		subr, err := client.GetSubchannel(context.Background(), &grpc_channelz_v1.GetSubchannelRequest{SubchannelId: sc.GetSubchannelId()})
-		if err != nil {
-			slog.Error("Error GetChannel", "err", err)
-			return "Error GetChannel"
-		}
-		ret = append(ret, subr)
-	}
-
-	return strRet + ToJSON(ret)
 }
 
 // SetTimeout allows to set your own timeout for GRPC health checks.
@@ -170,16 +111,19 @@ func (c *Client) Close() error {
 func (c *Client) GetBeacon(ctx context.Context, m *proto.Metadata, round uint64) (*HexBeacon, error) {
 	c.log.Debug("Client GetBeacon", "round", round)
 
-	client := proto.NewPublicClient(c.conn)
-
 	in := &proto.PublicRandRequest{
 		Round:    round,
 		Metadata: m,
 	}
 
-	randResp, err := client.PublicRand(ctx, in)
+	randResp, err := c.pc.PublicRand(ctx, in)
 	if err != nil {
-		return nil, err
+		// we do 1 retry with the next subconn if it failed
+		ctx := context.WithValue(ctx, SkipCtxKey{}, 1)
+		randResp, err = c.pc.PublicRand(ctx, in)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return NewHexBeacon(randResp), nil
@@ -188,8 +132,7 @@ func (c *Client) GetBeacon(ctx context.Context, m *proto.Metadata, round uint64)
 // Watch returns new randomness as it becomes available.
 func (c *Client) Watch(ctx context.Context, m *proto.Metadata) <-chan *HexBeacon {
 	c.log.Debug("Client Watch")
-	client := proto.NewPublicClient(c.conn)
-	stream, err := client.PublicRandStream(ctx, &proto.PublicRandRequest{Round: 0, Metadata: m})
+	stream, err := c.pc.PublicRandStream(ctx, &proto.PublicRandRequest{Round: 0, Metadata: m})
 	ch := make(chan *HexBeacon, 1)
 	if err != nil {
 		close(ch)
@@ -227,7 +170,14 @@ func (c *Client) Check(ctx context.Context) error {
 
 	resp, err := client.Check(tctx, &healthgrpc.HealthCheckRequest{})
 	if err != nil {
-		return err
+		slog.Debug("YOLOSWAG RETRY CHECK!")
+		// we do 1 retry with the next subconn if it failed
+		ctx := context.WithValue(tctx, SkipCtxKey{}, 1)
+		resp, err = client.Check(ctx, &healthgrpc.HealthCheckRequest{})
+		if err != nil {
+			return err
+		}
+		slog.Debug("YOLOSWAG IT PASSED!")
 	}
 
 	if resp.GetStatus() != healthgrpc.HealthCheckResponse_SERVING {
@@ -318,13 +268,11 @@ func (c *Client) GetChainInfo(ctx context.Context, m *proto.Metadata) (*JsonInfo
 
 	c.log.Debug("Client GetChainInfo knownChains", "cache", "MISS")
 
-	client := proto.NewPublicClient(c.conn)
-
 	in := &proto.ChainInfoRequest{
 		Metadata: m,
 	}
 
-	resp, err := client.ChainInfo(ctx, in)
+	resp, err := c.pc.ChainInfo(ctx, in)
 	if err != nil {
 		return nil, err
 	}
@@ -344,8 +292,7 @@ func (c *Client) GetChainInfo(ctx context.Context, m *proto.Metadata) (*JsonInfo
 func (c *Client) GetChains(ctx context.Context) ([]string, error) {
 	c.log.Debug("Client GetChains")
 
-	client := proto.NewPublicClient(c.conn)
-	resp, err := client.ListBeaconIDs(ctx, &proto.ListBeaconIDsRequest{})
+	resp, err := c.pc.ListBeaconIDs(ctx, &proto.ListBeaconIDsRequest{})
 	if err != nil {
 		c.log.Error("client.ListBeaconIDs", "err", err)
 		return nil, err
@@ -372,7 +319,7 @@ func (c *Client) GetChains(ctx context.Context) ([]string, error) {
 			Metadata: &proto.Metadata{ChainHash: chain},
 		}
 
-		info, err := client.ChainInfo(ctx, in)
+		info, err := c.pc.ChainInfo(ctx, in)
 		if err != nil {
 			c.log.Error("invalid call to ChainInfo", "err", err)
 			return nil, err

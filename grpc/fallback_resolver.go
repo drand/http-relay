@@ -19,7 +19,7 @@ type FallbackResolver struct {
 	cc     resolver.ClientConn
 }
 
-func (*FallbackResolver) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
+func (*FallbackResolver) Build(target resolver.Target, cc resolver.ClientConn, _ resolver.BuildOptions) (resolver.Resolver, error) {
 	r := &FallbackResolver{
 		target: target,
 		cc:     cc,
@@ -47,6 +47,6 @@ func (r *FallbackResolver) start() error {
 	return r.cc.UpdateState(resolver.State{Addresses: addrs})
 }
 
-func (*FallbackResolver) ResolveNow(o resolver.ResolveNowOptions) {}
+func (*FallbackResolver) ResolveNow(_ resolver.ResolveNowOptions) {}
 
 func (*FallbackResolver) Close() {}

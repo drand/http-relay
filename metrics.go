@@ -4,11 +4,10 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/drand/http-server/grpc"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
-
-const meterName = "YOLOSWAG"
 
 var (
 	// HTTPMetrics about the public surface area (http requests, cdn stuff)
@@ -21,20 +20,26 @@ var (
 		Name: "http_call_counter",
 		Help: "Number of HTTP calls received",
 	}, []string{"code", "method"})
+
 	// HTTPLatency (HTTP) how long http request handling takes
 	HTTPLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:        "http_response_duration",
-		Help:        "histogram of request latencies",
-		Buckets:     prometheus.DefBuckets,
+		Name: "http_response_duration",
+		Help: "histogram of request latencies",
+		// Based on our current AWS same region latency:
+		//  P50       P75      P90       P95      P99      P99.9     P99.99
+		//  1.094ms  6.62ms  17.886ms  25.78ms  48.124ms  81.533ms  123.466ms
+		// with extra long buckets to try and catch the connections that are "too early"
+		Buckets:     []float64{.002, .007, .02, .05, .125, .5, 1, 2, 5, 10, 25},
 		ConstLabels: prometheus.Labels{"handler": "http"},
 	}, []string{"method"})
+
 	// HTTPInFlight (HTTP) how many http requests exist
 	HTTPInFlight = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "http_in_flight",
 		Help: "A gauge of requests currently being served.",
 	})
 
-	// Client observation metrics
+	//// Client observation metrics
 
 	// ClientWatchLatency measures the latency of the watch channel from the client's perspective.
 	ClientWatchLatency = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -119,11 +124,12 @@ func serveMetrics() {
 	slog.Info("starting to serve metrics on localhost:9999/metrics")
 	http.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("serving metrics on localhost:9999/metrics")
+		grpc.UpdateMetrics()
 		handler.ServeHTTP(w, r)
 	}))
-	err := http.ListenAndServe(":9999", nil) //nolint:gosec // Ignoring G114
+	err := http.ListenAndServe(*metricFlag, nil) //nolint:gosec // Ignoring G114
 	if err != nil {
-		slog.Error("error serving http: %v", err)
+		slog.Error("error serving http metrics on %q: %v", *metricFlag, err)
 		return
 	}
 }
@@ -146,6 +152,11 @@ func bindMetrics() {
 	if err := RegisterClientMetrics(ClientMetrics); err != nil {
 		slog.Error("error in bindMetrics", "metrics", "bindMetrics", "err", err)
 		return
+	}
+
+	// grpc load balancer metrics
+	if err := grpc.RegisterMetrics(ClientMetrics); err != nil {
+		slog.Error("error in bindMetrics", "metrics", "bindMetrics", "err", err)
 	}
 }
 

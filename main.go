@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,31 +23,22 @@ import (
 )
 
 var (
-	jwtSecret   []byte
 	version     = "drand-http-server-v2.0.1"
-	grpcURL     = flag.String("grpc", "localhost:7001", "The URL and port to your drand node's grpc port, e.g. pl1-rpc.testnet.drand.sh:443 you can add fallback nodes by separating them with a comma: pl1-rpc.testnet.drand.sh:443,pl2-rpc.testnet.drand.sh:443")
+	metricFlag  = flag.String("metrics", "localhost:9999", "The flag to set the interface for metrics. Defaults to localhost:9999")
+	grpcURL     = flag.String("grpc", "localhost:4444", "The URL and port to your drand node's grpc port, e.g. pl1-rpc.testnet.drand.sh:443 you can add fallback nodes by separating them with a comma: pl1-rpc.testnet.drand.sh:443,pl2-rpc.testnet.drand.sh:443")
 	goVersion   = flag.Bool("version", false, "Displays the current server version.")
 	requireAuth = flag.Bool("enable-auth", false, "Forces JWT authentication on V2 API using the JWT secret from the AUTH_TOKEN env variable.")
 	verbose     = flag.Bool("verbose", false, "Prints as many logs as possible.")
 	jsonFlag    = flag.Bool("json", false, "Prints logs in JSON format.")
+	frontrun    = flag.Int64("frontrun", 0, "When waiting for the next round, start the query this amount of ms earlier to counteract network latency.")
 )
 
 func init() {
 	flag.Parse()
-	// TODO: consider migrating to AWS secret manager
-	token, provided := os.LookupEnv("AUTH_TOKEN")
-	if !provided || len(token) < 256 {
-		slog.Warn("AUTH_TOKEN not set to a 128 byte hex-encoded secret, disabling authenticated API")
-		*requireAuth = false
-	} else {
-		var err error
-		jwtSecret, err = hex.DecodeString(token)
-		if err != nil {
-			slog.Error("unable to parse AUTH_TOKEN as valid hex, disabling authenticated API")
-			*requireAuth = false
-		}
-	}
 	slog.SetLogLoggerLevel(getLogLevel())
+	if *frontrun > 0 {
+		FrontrunTiming = time.Duration(*frontrun) * time.Millisecond
+	}
 }
 
 func main() {
@@ -86,19 +76,19 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
-		<-sig
+		defer serverStopCtx()
+		s := <-sig
+
+		slog.Info("Caught interrupt, shutting down...", "signal", s.String())
 
 		// Shutdown signal with grace period of 30 seconds
-		shutdownCtx, cancel := context.WithTimeout(serverCtx, 30*time.Second)
-
+		shutdownCtx, _ := context.WithTimeout(serverCtx, 30*time.Second)
 		go func() {
 			<-shutdownCtx.Done()
 			if errors.Is(shutdownCtx.Err(), context.DeadlineExceeded) {
 				slog.Error("graceful shutdown timed out.. forcing exit")
 				return
 			}
-			// make sure to cancel context otherwise
-			cancel()
 		}()
 
 		// Trigger graceful shutdown
@@ -106,7 +96,6 @@ func main() {
 			slog.Error("server Shutdown error", "err", err)
 			return
 		}
-		serverStopCtx()
 	}()
 
 	// Run the server
@@ -130,6 +119,9 @@ func prometheusMiddleware(next http.Handler) http.Handler {
 				promhttp.InstrumentHandlerInFlight(
 					HTTPInFlight,
 					next)))
+		// We could also instrument:
+		// 	- time to write headers, but since we have common headers, these aren't too useful
+		//  - request size, but these are supposedly fixed size and are in the logs
 		fn.ServeHTTP(w, r)
 	})
 }
@@ -137,10 +129,12 @@ func prometheusMiddleware(next http.Handler) http.Handler {
 func setup(client *grpc.Client) http.Handler {
 	// setup chi router
 	r := chi.NewRouter()
-	// putting our metric middleware first to get timing right
+
+	// putting the metric middleware first to get timing right
 	r.Use(prometheusMiddleware)
+
 	// setup logger middleware
-	logger := newLogger(httplog.Options{
+	logger := httplog.NewLogger("drand-http-relay", httplog.Options{
 		JSON:            *jsonFlag,
 		LogLevel:        getLogLevel(),
 		Concise:         !(*verbose),
@@ -153,16 +147,23 @@ func setup(client *grpc.Client) http.Handler {
 		// },
 		// QuietDownPeriod: 1 * time.Second, // not supported by our logger
 	})
-	r.Use(handleLogger(logger)) // also setups Request ID and Panic recoverer
+	// this also setups Request ID and Panic recoverer middleware behind the hood
+	r.Use(httplog.RequestLogger(logger))
 
 	// setup ping endpoint for load balancers and uptime testing, without ACLs
 	r.Use(middleware.Heartbeat("/ping"))
 
 	if *verbose {
+		// when running in verbose mode, we have a special Debug log telling us for each request whether it was matched
+		// or not by Chi against a given route.
 		r.Use(trackRoute)
 	}
 
 	r.Get("/chanz", GetChanz(client))
+
+	// For now, rate-limiting is left to the nginx reverse proxy...
+	//// Only 5 requests will be processed at a time.
+	//r.Use(middleware.Throttle(5))
 
 	// v2 with ACL protected routes with shared grpc client
 	r.Group(func(r chi.Router) {
@@ -172,7 +173,7 @@ func setup(client *grpc.Client) http.Handler {
 		}
 		r.Use(apiVersionCtx("v2"))
 		r.Route("/v2", func(r chi.Router) {
-			// use our common headers
+			// use our common headers for the following routes
 			r.Use(addCommonHeaders)
 			r.Get("/chains", GetChains(client))
 
@@ -191,10 +192,9 @@ func setup(client *grpc.Client) http.Handler {
 
 	// v1 API
 	r.Group(func(r chi.Router) {
-		// use our common headers
+		// use our common headers for the following routes
 		r.Use(addCommonHeaders)
-		// Only 5 requests will be processed at a time (supposedly the caching should handle the others).
-		r.Use(middleware.Throttle(5))
+
 		r.Use(apiVersionCtx("v1"))
 		r.Get("/chains", GetChains(client))
 		r.Get("/info", GetInfoV1(client))

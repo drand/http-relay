@@ -62,13 +62,9 @@ type logPicker struct {
 
 func (p *logPicker) Pick(i balancer.PickInfo) (balancer.PickResult, error) {
 	result, err := p.sub.Pick(i)
-	p.log.Info("Pick", "endpoint", result.SubConn, "metadata", result.Metadata, "rpc", i.FullMethodName)
+	p.log.Info("Pick", "endpoint", result.SubConn, "rpc", i.FullMethodName, "md", result.Metadata, "err", err)
 	return result, err
 }
-
-//func (p *picker) String() string {
-//	return p.
-//}
 
 type wrappedClientConn struct {
 	balancer.ClientConn
@@ -90,12 +86,12 @@ func (w *wrappedClientConn) UpdateState(s balancer.State) {
 func (w *wrappedClientConn) NewSubConn(addrs []resolver.Address, opts balancer.NewSubConnOptions) (balancer.SubConn, error) {
 	// in a future release, NewSubConn will only support a single address, so let's make sure we do that already.
 	addr := addrs[0]
-	w.log.Warn("NewSubConn called", "addrs", len(addrs), "first", addr)
+	w.log.Debug("NewSubConn called", "addrs", len(addrs), "first", addr)
 	nOpts := balancer.NewSubConnOptions{
 		CredsBundle:        opts.CredsBundle,
 		HealthCheckEnabled: opts.HealthCheckEnabled,
 		StateListener: func(state balancer.SubConnState) {
-			w.log.Debug("StateListener", "addr", addr, "state", state)
+			w.log.Debug("StateListener", "addr", addr.Addr, "state", state)
 			opts.StateListener(state)
 		},
 	}

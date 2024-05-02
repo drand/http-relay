@@ -3,7 +3,6 @@ package grpc
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"slices"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,6 +10,7 @@ import (
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/base"
 	"google.golang.org/grpc/grpclog"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/serviceconfig"
 )
 
@@ -24,7 +24,7 @@ var (
 	)
 )
 
-var grpclogger = grpclog.Component("fallback_picker")
+var fbLog = grpclog.Component("fallbackLB")
 
 const fallbackName = "pick_first_with_fallback"
 
@@ -59,8 +59,12 @@ func (fallbackBB) Name() string {
 }
 
 func (fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Balancer {
-	b := &fallbackBalancer{scAddrs: make(map[balancer.SubConn]string)}
-	baseBuilder := base.NewBalancerBuilder(fallbackName, b, base.Config{HealthCheck: true})
+	b := &fallbackBalancer{scAddrs: make(map[balancer.SubConn]*scWithAddr)}
+	baseBuilder := base.NewBalancerBuilder(fallbackName, b,
+		base.Config{
+			//TODO: understand better whether or not we want to rely on the built-in grpc HealthCheck
+			HealthCheck: false,
+		})
 	b.Balancer = baseBuilder.Build(cc, bOpts)
 	return b
 }
@@ -69,36 +73,27 @@ type fallbackBalancer struct {
 	// Embeds balancer.Balancer because needs to intercept UpdateClientConnState to learn state.
 	balancer.Balancer
 
-	fallbackSeconds uint32
-	scAddrs         map[balancer.SubConn]string // Hold onto SubConn address to keep track for subsequent picker updates.
+	scAddrs map[balancer.SubConn]*scWithAddr // Hold onto SubConn address to keep track for subsequent picker updates.
 }
 
 func (fb *fallbackBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
-	lrCfg, ok := s.BalancerConfig.(*LBConfig)
-	if !ok {
-		slog.Error("pick_first_with_fallback: received config with unexpected type %T: %v", s.BalancerConfig, s.BalancerConfig)
-		lrCfg = &LBConfig{
-			FallbackSeconds: 0,
-		}
-	}
-
 	addrs := s.ResolverState.Addresses
+	fbLog.Info("Called UpdateClientConnState with addresses", len(addrs))
 	if len(addrs) == 0 {
-		// The resolver reported an empty address list. Treat it like an error by
-		// calling b.ResolverError.
+		// The resolver reported an empty address list.
+		// Treat it like an error by calling b.ResolverError.
+		// In theory this should never happen with our own custom resolver
 		for sc, addr := range fb.scAddrs {
-			// Shut down the old subConn. All addresses were removed, so it is
-			// no longer valid.
+			// Shut down the old subConn. All addresses were removed, so it is no longer valid.
 			sc.Shutdown()
-			slog.Warn("shutting down SubConn", "addr", addr)
+			fbLog.Info("shutting down SubConn", "addr", addr)
 			delete(fb.scAddrs, sc)
 		}
-		slog.Warn("resolver provided zero addresses")
+		fbLog.Warning("resolver provided zero addresses")
+		// it is important to shutdown all SubConn above since ResolverError relies on len(ReadySC) to re-resolve
 		fb.Balancer.ResolverError(fmt.Errorf("resolver provided zero addresses"))
 		return balancer.ErrBadResolverState
 	}
-
-	fb.fallbackSeconds = lrCfg.FallbackSeconds
 
 	return fb.Balancer.UpdateClientConnState(s)
 }
@@ -110,11 +105,21 @@ type scWithAddr struct {
 	order int
 }
 
-func scCmp(a, b scWithAddr) int {
-	return b.order - a.order // we inverted the order to have a list in descending order
+func (s *scWithAddr) String() string {
+	return fmt.Sprintf("%d-%s-%v", s.order, s.addr, s.ready)
 }
 
-func insert(scs []scWithAddr, s scWithAddr) []scWithAddr {
+// scCmp should return 0 if the slice element s matches
+// the target t, a negative number if the slice element s precedes the target t,
+// or a positive number if the slice element s follows the target t.
+// cmp must implement the same ordering as the slice, such that if
+// cmp(a, t) < 0 and cmp(b, t) >= 0, then a must precede b in the slice.
+func scCmp(s, t *scWithAddr) int {
+	return s.order - t.order
+}
+
+// insert will insert s in scs in a sorted way, relying on the above comparison function. It will be in ascending order.
+func insert(scs []*scWithAddr, s *scWithAddr) []*scWithAddr {
 	i, _ := slices.BinarySearchFunc(scs, s, scCmp) // find slot
 	return slices.Insert(scs, i, s)
 }
@@ -122,42 +127,50 @@ func insert(scs []scWithAddr, s scWithAddr) []scWithAddr {
 // Build is implementing the base.PickerBuilder interface, expecting a ReadySCs list of SubConn that are ready to
 // be used, and we build our list of addresses using it.
 func (fb *fallbackBalancer) Build(info base.PickerBuildInfo) balancer.Picker {
-	slog.Debug("fallbackPicker built called", "#readySC", len(info.ReadySCs))
+	fbLog.Info("fallbackPicker built called", "#readySC", len(info.ReadySCs))
 	if len(info.ReadySCs) == 0 {
 		return base.NewErrPicker(balancer.ErrNoSubConnAvailable)
 	}
 
-	for sc := range fb.scAddrs {
-		if _, ok := info.ReadySCs[sc]; !ok { // If no longer ready, no more need for it.
-			sc.Shutdown()
-			delete(fb.scAddrs, sc)
+	for sc, sca := range fb.scAddrs {
+		if _, ok := info.ReadySCs[sc]; !ok {
+			// If no longer ready, we are in a degraded state!
+			// This might mean an endpoint changed their resolved IP, which we do not handle gracefully yet
+			// but most likely means a connection is failing temporarily and should be checked again soon.
+			// We rely on the grpc built-in reconnect backoff process to re-trigger
+			fbLog.Warning("SubConn not ready anymore", "addr", sca.addr)
+			sca.ready = false
 		}
 	}
 
-	scs := make([]scWithAddr, 0, len(info.ReadySCs))
+	scs := make([]*scWithAddr, 0, len(info.ReadySCs))
 	// Create new refs if needed and add them to picker list in correct order based on their attribute
 	for sc, addr := range info.ReadySCs {
 		order, ok := addr.Address.Attributes.Value("order").(int)
 		if !ok {
-			slog.Error("invalid order attribute on Address, make sure to use a compatible resolver", "addr", addr)
+			fbLog.Error("invalid order attribute on Address, make sure to use a compatible resolver", "addr", addr)
 			continue
 		}
 
-		slog.Warn("Got SubConn with order", "order", order)
-		if _, ok := fb.scAddrs[sc]; !ok {
-			fb.scAddrs[sc] = addr.Address.String()
-		}
-
-		// we insert in correct order
-		scs = insert(scs, scWithAddr{
+		sca := &scWithAddr{
 			sc:    sc,
-			addr:  addr.Address.String(),
+			addr:  addr.Address.Addr,
 			ready: true,
 			order: order,
-		})
+		}
+
+		fbLog.Info("Processing Ready SubConn", "addr", addr.Address, "order", order)
+		if oldAddr, ok := fb.scAddrs[sc]; !ok {
+			fb.scAddrs[sc] = sca
+		} else if oldAddr != fb.scAddrs[sc] {
+			fbLog.Error("Conflicting SubConn", "oldAddr", oldAddr, "newAddr", fb.scAddrs[sc])
+		}
+
+		// we insert in correct order, by priority
+		scs = insert(scs, sca)
 	}
 
-	slog.Warn("Prepared readySCs", "scs", scs)
+	fbLog.Error("Prepared readySCs", "scs", scs)
 
 	return &picker{
 		subConns: scs,
@@ -166,34 +179,46 @@ func (fb *fallbackBalancer) Build(info base.PickerBuildInfo) balancer.Picker {
 
 type picker struct {
 	// Built out when receives list of ready RPCs.
-	subConns []scWithAddr
+	subConns []*scWithAddr
 }
 
-func (p *picker) Pick(balancer.PickInfo) (balancer.PickResult, error) {
+type SkipCtxKey struct{}
+
+func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 	var pickedSC *scWithAddr
 
+	// we rely on the 0 value of int being 0 when the key isn't set
+	skip, _ := b.Ctx.Value(SkipCtxKey{}).(int)
+	var skipped int
+
+	// subConns are in the priority order set by the resolver
 	for _, sc := range p.subConns {
+		fbLog.Info("considering to pick", "addr", sc.addr, "order", sc.order, "ready", sc.ready)
 		if sc.ready {
-			pickedSC = &sc
+			if skip > 0 {
+				fbLog.Error("skipping SubConn", "addr", sc.addr, "order", sc.order)
+				skip--
+				skipped++
+				continue
+			}
+			pickedSC = sc
+			break
 		}
 	}
 
 	if pickedSC == nil {
+		fbLog.Error("Pick had no available SubConn", "subConnes", p.subConns, "skipped", skipped)
 		return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
 	}
 
 	// The metric for a subchannel should be atomically incremented by one
 	// after it has been successfully picked by the picker
 	RequestsCounter.With(prometheus.Labels{"node": pickedSC.addr}).Inc()
-	slog.Warn("chose sc", "addr", pickedSC.addr)
+	fbLog.Info("Picked SubConn", "addr", pickedSC.addr, "skipped", skipped)
 	return balancer.PickResult{
 		SubConn: pickedSC.sc,
-		Done: func(info balancer.DoneInfo) {
-			// when a SubConn is not ready, it will call Done with a nil DoneInfo
-			if info.BytesReceived == false && info.BytesSent == false && info.Err == nil {
-				slog.Warn("SubConn not ready anymore", "addr", pickedSC.addr)
-				pickedSC.ready = false
-			}
-		},
+		//// We could define a Done function on the PickResults too
+		//Done: func(info balancer.DoneInfo) {},
+		Metadata: metadata.MD{"target": []string{pickedSC.addr}},
 	}, nil
 }

@@ -1,16 +1,33 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
 func AddAuth(next http.Handler) http.Handler {
+	var jwtSecret []byte
+
+	// TODO: consider migrating to AWS secret manager instead of using env variables
+	token, provided := os.LookupEnv("AUTH_TOKEN")
+	if !provided || len(token) < 256 {
+		slog.Warn("AUTH_TOKEN not set to a 128 byte hex-encoded secret, disabling authenticated API")
+		return next
+	} else {
+		var err error
+		jwtSecret, err = hex.DecodeString(token)
+		if err != nil {
+			slog.Error("unable to parse AUTH_TOKEN as valid hex, disabling authenticated API")
+			return next
+		}
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := strings.Split(r.Header.Get("Authorization"), "Bearer ")
 		if len(authHeader) != 2 {
@@ -45,21 +62,22 @@ func AddAuth(next http.Handler) http.Handler {
 	})
 }
 
-func GetJWT(w http.ResponseWriter, r *http.Request) {
-	// Create a new token object
-	token := jwt.New(jwt.SigningMethodHS256)
-
-	// Create a JWT and send it as response
-	tokenString, err := token.SignedString(jwtSecret)
-	if err != nil {
-		http.Error(w, "Error while signing the token", http.StatusInternalServerError)
-		return
-	}
-
-	response := map[string]string{
-		"token": tokenString,
-	}
-
-	slog.Info("Emitted a JWT token", "token", tokenString)
-	json.NewEncoder(w).Encode(response)
-}
+//// GetJWT is an endpoint returning a valid JWT, be careful not to expose it where it shouldn't be exposed!
+//func GetJWT(w http.ResponseWriter, r *http.Request) {
+//	// Create a new token object
+//	token := jwt.New(jwt.SigningMethodHS256)
+//
+//	// Create a JWT and send it as response
+//	tokenString, err := token.SignedString(jwtSecret)
+//	if err != nil {
+//		http.Error(w, "Error while signing the token", http.StatusInternalServerError)
+//		return
+//	}
+//
+//	response := map[string]string{
+//		"token": tokenString,
+//	}
+//
+//	slog.Info("Emitted a JWT token", "token", tokenString)
+//	json.NewEncoder(w).Encode(response)
+//}
