@@ -157,8 +157,6 @@ func setup(client *grpc.Client) http.Handler {
 		r.Use(trackRoute)
 	}
 
-	r.Get("/chanz", GetChanz(client))
-
 	// For now, rate-limiting is left to the nginx reverse proxy...
 	//// Only 5 requests will be processed at a time.
 	//r.Use(middleware.Throttle(5))

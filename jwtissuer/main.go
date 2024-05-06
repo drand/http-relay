@@ -56,7 +56,7 @@ func main() {
 		"token": tokenString,
 	}
 
-	log.Println("Created a valid JWT token", "token", tokenString)
+	log.Println("Created a valid JWT", "token", tokenString)
 	res, err := json.Marshal(response)
 	if err != nil {
 		log.Fatal("Unable to marshal JWT token:", err)

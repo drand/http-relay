@@ -33,7 +33,7 @@ func AddAuth(next http.Handler) http.Handler {
 		if len(authHeader) != 2 {
 			slog.Error("Received invalid request, JWT not recognized", "Authorization", authHeader)
 
-			http.Error(w, "Invalid JWT token", http.StatusUnauthorized)
+			http.Error(w, "Missing JWT", http.StatusUnauthorized)
 			return
 		}
 
