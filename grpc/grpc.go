@@ -23,8 +23,10 @@ import (
 )
 
 func init() {
+	balancer.Register(NewFallbackBuilder(3 * time.Second))
 	// registers the logging_pick_first_with_fallback balancer
 	balancer.Register(NewLoggingBalancerBuilder("pick_first_with_fallback", slog.With("service", "balancer")))
+	bindMetrics()
 }
 
 type logger interface {
@@ -35,36 +37,44 @@ type logger interface {
 }
 
 // Client represent a drand GRPC client, it connects to a single node at serverAddr, stores the connection in conn
-// it has a knownChains map of known chain info keyed using the hex-encoded chainhash of a beacon chain. The timeout
+// it has a knownChains map of known chain info keyed using the hex-encoded chainhash of a beacon chain. The checkTimeout
 // is used for health checks only currently.
 type Client struct {
-	conn        *grpc.ClientConn
-	pc          proto.PublicClient
-	serverAddr  string
-	knownChains sync.Map
-	timeout     time.Duration
-	metrics     *grpcprom.ClientMetrics
-	log         logger
+	conn         *grpc.ClientConn
+	pc           proto.PublicClient
+	serverAddr   string
+	knownChains  sync.Map
+	checkTimeout time.Duration
+	log          logger
 }
 
 // NewClient establishes a new non-TLS grpc connection to the provided server address. It takes a logger and uses
-// a default value for timeout.
+// a default value for checkTimeout.
 func NewClient(serverAddr string, l logger) (*Client, error) {
 	l.Debug("NewClient", "serverAddr", serverAddr)
 
-	// setup metrics
+	// setup metrics for GRPC calls
 	clMetrics := grpcprom.NewClientMetrics(
 		grpcprom.WithClientHandlingTimeHistogram(
-			grpcprom.WithHistogramBuckets([]float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 2, 3, 6, 20, 30}),
+			// Based on our current AWS same region latency:
+			//  P50       P75      P90       P95      P99      P99.9     P99.99
+			//  1.094ms  6.62ms  17.886ms  25.78ms  48.124ms  81.533ms  123.466ms
+			// with extra long buckets to try and catch the connections that are "too early"
+			grpcprom.WithHistogramBuckets([]float64{.002, .007, .02, .05, .125, .5, 1, 2, 5, 10, 25}),
 		),
 	)
+
+	// register client metrics
+	ClientMetrics.Register(clMetrics)
 
 	conn, err := grpc.Dial(serverAddr,
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first_with_fallback"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
+			// TODO: do we really want a 500ms default checkTimeout on unary RPC?
 			timeout.UnaryClientInterceptor(500*time.Millisecond),
 			clMetrics.UnaryClientInterceptor(),
+			UsedEndpointInterceptor(l),
 		),
 		grpc.WithChainStreamInterceptor(
 			clMetrics.StreamClientInterceptor(),
@@ -75,30 +85,27 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		l.Error("Unable to Dial", "err", err)
 	}
 	client := &Client{
-		conn:       conn,
-		pc:         proto.NewPublicClient(conn),
-		serverAddr: serverAddr,
-		timeout:    3 * time.Second,
-		metrics:    clMetrics,
-		log:        l,
+		conn:         conn,
+		pc:           proto.NewPublicClient(conn),
+		serverAddr:   serverAddr,
+		checkTimeout: 3 * time.Second,
+		log:          l,
 	}
 
-	go startMonitoringServer("127.0.0.1:7555")
+	// TODO: this is probably not the right place to setup the grpc monitoring server?
+	// or should its address be just another of NewClient arguments?
+	startMonitoringServer("127.0.0.1:7555")
 
-	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms timeout built-in above
+	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms checkTimeout built-in above
 	_, err = client.GetChains(context.Background())
 	return client, err
 }
 
-func (c *Client) GetMetrics() *grpcprom.ClientMetrics {
-	return c.metrics
-}
-
-// SetTimeout allows to set your own timeout for GRPC health checks.
+// SetTimeout allows to set your own checkTimeout for GRPC health checks.
 func (c *Client) SetTimeout(timeout time.Duration) {
 	c.log.Debug("Client SetTimeout")
 
-	c.timeout = timeout
+	c.checkTimeout = timeout
 }
 
 func (c *Client) Close() error {
@@ -118,8 +125,8 @@ func (c *Client) GetBeacon(ctx context.Context, m *proto.Metadata, round uint64)
 
 	randResp, err := c.pc.PublicRand(ctx, in)
 	if err != nil {
-		// we do 1 retry with the next subconn if it failed
-		ctx := context.WithValue(ctx, SkipCtxKey{}, 1)
+		c.log.Debug("GetBeacon failed once")
+		// we do 1 retry (automagically with the next subconn thanks to the fallback LB) if it failed
 		randResp, err = c.pc.PublicRand(ctx, in)
 		if err != nil {
 			return nil, err
@@ -165,19 +172,16 @@ func (c *Client) Check(ctx context.Context) error {
 
 	client := healthgrpc.NewHealthClient(c.conn)
 
-	tctx, cancel := context.WithTimeout(ctx, c.timeout)
+	tctx, cancel := context.WithTimeout(ctx, c.checkTimeout)
 	defer cancel()
 
 	resp, err := client.Check(tctx, &healthgrpc.HealthCheckRequest{})
 	if err != nil {
-		slog.Debug("YOLOSWAG RETRY CHECK!")
-		// we do 1 retry with the next subconn if it failed
-		ctx := context.WithValue(tctx, SkipCtxKey{}, 1)
+		// we do 1 retry (automagically with the next subconn thanks to the fallback LB) if it failed
 		resp, err = client.Check(ctx, &healthgrpc.HealthCheckRequest{})
 		if err != nil {
 			return err
 		}
-		slog.Debug("YOLOSWAG IT PASSED!")
 	}
 
 	if resp.GetStatus() != healthgrpc.HealthCheckResponse_SERVING {

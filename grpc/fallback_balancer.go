@@ -1,16 +1,21 @@
 package grpc
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"slices"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/base"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/serviceconfig"
 )
 
@@ -28,10 +33,6 @@ var fbLog = grpclog.Component("fallbackLB")
 
 const fallbackName = "pick_first_with_fallback"
 
-func init() {
-	balancer.Register(fallbackBB{})
-}
-
 // LBConfig is the balancer config for pick_first_with_fallback balancer.
 type LBConfig struct {
 	serviceconfig.LoadBalancingConfig `json:"-"`
@@ -41,25 +42,27 @@ type LBConfig struct {
 	FallbackSeconds uint32 `json:"fallbackSeconds,omitempty"`
 }
 
-type fallbackBB struct{}
+// NewFallbackBuilder returns a fallback balancer builder configured with the given timeout, meant to be registered.
+func NewFallbackBuilder(timeout time.Duration) balancer.Builder {
+	fbLog.Error("building fallback balancer", "timeout", timeout)
 
-func (fallbackBB) ParseConfig(s json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
-	lbConfig := &LBConfig{
-		FallbackSeconds: 3,
+	return &fallbackBB{
+		timeout: timeout,
 	}
-	if err := json.Unmarshal(s, lbConfig); err != nil {
-		return nil, fmt.Errorf("least-request: unable to unmarshal LBConfig: %v", err)
-	}
+}
 
-	return lbConfig, nil
+type fallbackBB struct {
+	timeout time.Duration
 }
 
 func (fallbackBB) Name() string {
 	return fallbackName
 }
 
-func (fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Balancer {
-	b := &fallbackBalancer{scAddrs: make(map[balancer.SubConn]*scWithAddr)}
+func (f fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Balancer {
+	b := &fallbackBalancer{scAddrs: make(map[balancer.SubConn]*scWithAddr), closing: make(chan struct{})}
+	go b.run(f.timeout)
+	// we delegate the actual SubConn management to the base balancer
 	baseBuilder := base.NewBalancerBuilder(fallbackName, b,
 		base.Config{
 			//TODO: understand better whether or not we want to rely on the built-in grpc HealthCheck
@@ -73,13 +76,74 @@ type fallbackBalancer struct {
 	// Embeds balancer.Balancer because needs to intercept UpdateClientConnState to learn state.
 	balancer.Balancer
 
+	mu sync.RWMutex
+
 	scAddrs map[balancer.SubConn]*scWithAddr // Hold onto SubConn address to keep track for subsequent picker updates.
+	closing chan struct{}
+}
+
+// Function to continuously process updates
+func (fb *fallbackBalancer) run(timeout time.Duration) {
+	ticker := time.NewTimer(timeout)
+	for {
+		select {
+		case <-ticker.C:
+			fb.mu.Lock()
+			// every tick, we reset the state of all subconn, the ones whose underlying SubConn is actually not working
+			// are deleted from that list
+			for _, sc := range fb.scAddrs {
+				sc.ready = true
+			}
+			fb.mu.Unlock()
+			ticker.Reset(timeout)
+		case <-fb.closing:
+			fb.mu.Lock()
+			ticker.Stop()
+			// we empty the balancer
+			for sc, _ := range fb.scAddrs {
+				delete(fb.scAddrs, sc)
+			}
+			fb.mu.Unlock()
+			// now we call the underlying balancer Close()
+			fb.Balancer.Close()
+			return
+		}
+	}
+}
+
+func (fb *fallbackBalancer) Close() {
+	close(fb.closing)
+}
+
+func (fb *fallbackBalancer) update(sc balancer.SubConn, ready bool) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if sca, ok := fb.scAddrs[sc]; !ok {
+		fbLog.Error("trying to update state on a non-existent subconn", "subconn", sc)
+	} else {
+		sca.ready = ready
+	}
+}
+
+func (fb *fallbackBalancer) firstTwoReady() (*scWithAddr, *scWithAddr) {
+	fb.mu.RLock()
+	defer fb.mu.RUnlock()
+	ret := make([]*scWithAddr, 2, len(fb.scAddrs)+2)
+	for _, sca := range fb.scAddrs {
+		if sca.ready && sca.order >= 0 {
+			// we insert in correct order, by priority
+			ret = insert(ret, sca)
+		}
+	}
+
+	return ret[0], ret[1]
 }
 
 func (fb *fallbackBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
 	addrs := s.ResolverState.Addresses
 	fbLog.Info("Called UpdateClientConnState with addresses", len(addrs))
 	if len(addrs) == 0 {
+		fb.mu.Lock()
 		// The resolver reported an empty address list.
 		// Treat it like an error by calling b.ResolverError.
 		// In theory this should never happen with our own custom resolver
@@ -89,8 +153,10 @@ func (fb *fallbackBalancer) UpdateClientConnState(s balancer.ClientConnState) er
 			fbLog.Info("shutting down SubConn", "addr", addr)
 			delete(fb.scAddrs, sc)
 		}
+		fb.mu.Unlock()
 		fbLog.Warning("resolver provided zero addresses")
-		// it is important to shutdown all SubConn above since ResolverError relies on len(ReadySC) to re-resolve
+		// TODO: is this true:
+		// it's important to shutdown all SubConn above since ResolverError relies on len(ReadySC) to re-resolve
 		fb.Balancer.ResolverError(fmt.Errorf("resolver provided zero addresses"))
 		return balancer.ErrBadResolverState
 	}
@@ -99,9 +165,12 @@ func (fb *fallbackBalancer) UpdateClientConnState(s balancer.ClientConnState) er
 }
 
 type scWithAddr struct {
-	sc    balancer.SubConn
-	addr  string
+	sc balancer.SubConn
+	// the underlying target's address
+	addr string
+	// whether this SubConn is currently considered ready or not
 	ready bool
+	// order is used to prioritze the SubConn to use, a negative one leads to it not being used at all
 	order int
 }
 
@@ -114,12 +183,21 @@ func (s *scWithAddr) String() string {
 // or a positive number if the slice element s follows the target t.
 // cmp must implement the same ordering as the slice, such that if
 // cmp(a, t) < 0 and cmp(b, t) >= 0, then a must precede b in the slice.
+// For nil values, we consider them "larger" than anything
 func scCmp(s, t *scWithAddr) int {
+	if s == nil {
+		return 1
+	} else if t == nil {
+		return -1
+	}
 	return s.order - t.order
 }
 
 // insert will insert s in scs in a sorted way, relying on the above comparison function. It will be in ascending order.
 func insert(scs []*scWithAddr, s *scWithAddr) []*scWithAddr {
+	if s == nil {
+		return scs
+	}
 	i, _ := slices.BinarySearchFunc(scs, s, scCmp) // find slot
 	return slices.Insert(scs, i, s)
 }
@@ -132,14 +210,16 @@ func (fb *fallbackBalancer) Build(info base.PickerBuildInfo) balancer.Picker {
 		return base.NewErrPicker(balancer.ErrNoSubConnAvailable)
 	}
 
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+
 	for sc, sca := range fb.scAddrs {
 		if _, ok := info.ReadySCs[sc]; !ok {
-			// If no longer ready, we are in a degraded state!
 			// This might mean an endpoint changed their resolved IP, which we do not handle gracefully yet
-			// but most likely means a connection is failing temporarily and should be checked again soon.
-			// We rely on the grpc built-in reconnect backoff process to re-trigger
+			// but most likely means a connection is failing temporarily.
+			// We rely on the grpc built-in reconnect backoff process to re-trigger this through the baseBalancer.
 			fbLog.Warning("SubConn not ready anymore", "addr", sca.addr)
-			sca.ready = false
+			delete(fb.scAddrs, sc)
 		}
 	}
 
@@ -160,65 +240,83 @@ func (fb *fallbackBalancer) Build(info base.PickerBuildInfo) balancer.Picker {
 		}
 
 		fbLog.Info("Processing Ready SubConn", "addr", addr.Address, "order", order)
-		if oldAddr, ok := fb.scAddrs[sc]; !ok {
-			fb.scAddrs[sc] = sca
-		} else if oldAddr != fb.scAddrs[sc] {
-			fbLog.Error("Conflicting SubConn", "oldAddr", oldAddr, "newAddr", fb.scAddrs[sc])
-		}
-
-		// we insert in correct order, by priority
-		scs = insert(scs, sca)
+		// we replace the sca in our LB in case its addr or order was changed
+		fb.scAddrs[sc] = sca
 	}
 
-	fbLog.Error("Prepared readySCs", "scs", scs)
+	fbLog.Info("Prepared fallback LB picker with ready SubConns", "scs", scs)
 
 	return &picker{
-		subConns: scs,
+		fb: fb,
 	}
 }
 
 type picker struct {
-	// Built out when receives list of ready RPCs.
-	subConns []*scWithAddr
+	fb *fallbackBalancer
+}
+
+func (p *picker) String() string {
+	if p == nil || p.fb == nil {
+		return "nil"
+	}
+	var sb strings.Builder
+	sb.WriteString("[ ")
+	first, second := p.fb.firstTwoReady()
+	if first != nil {
+		sb.WriteString(first.String() + "; ")
+	}
+	if second != nil {
+		sb.WriteString(second.String() + "; ")
+	}
+	sb.WriteString("]")
+	return sb.String()
 }
 
 type SkipCtxKey struct{}
 
 func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
-	var pickedSC *scWithAddr
-
 	// we rely on the 0 value of int being 0 when the key isn't set
-	skip, _ := b.Ctx.Value(SkipCtxKey{}).(int)
-	var skipped int
+	skip, _ := b.Ctx.Value(SkipCtxKey{}).(bool)
 
-	// subConns are in the priority order set by the resolver
-	for _, sc := range p.subConns {
-		fbLog.Info("considering to pick", "addr", sc.addr, "order", sc.order, "ready", sc.ready)
-		if sc.ready {
-			if skip > 0 {
-				fbLog.Error("skipping SubConn", "addr", sc.addr, "order", sc.order)
-				skip--
-				skipped++
-				continue
-			}
-			pickedSC = sc
-			break
-		}
+	first, second := p.fb.firstTwoReady()
+	fbLog.Error("considering to pick", "first", first, "second", second, "skip", skip)
+	picked := first
+	// we got a skip context, so we'll try to see if there is a next subconn
+	if skip && second != nil {
+		fbLog.Error("skipping & disabling SubConn", "addr", first.addr, "order", first.order)
+		p.fb.update(first.sc, false)
+		picked = second
 	}
 
-	if pickedSC == nil {
-		fbLog.Error("Pick had no available SubConn", "subConnes", p.subConns, "skipped", skipped)
+	if picked == nil {
+		fbLog.Error("Pick had no available SubConn", "skipped", skip)
 		return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
 	}
 
 	// The metric for a subchannel should be atomically incremented by one
 	// after it has been successfully picked by the picker
-	RequestsCounter.With(prometheus.Labels{"node": pickedSC.addr}).Inc()
-	fbLog.Info("Picked SubConn", "addr", pickedSC.addr, "skipped", skipped)
+	RequestsCounter.With(prometheus.Labels{"node": picked.addr}).Inc()
+	fbLog.Info("Picked SubConn", "addr", picked.addr, "skipped", skip)
 	return balancer.PickResult{
-		SubConn: pickedSC.sc,
-		//// We could define a Done function on the PickResults too
-		//Done: func(info balancer.DoneInfo) {},
-		Metadata: metadata.MD{"target": []string{pickedSC.addr}},
+		SubConn: picked.sc,
+		Done: func(info balancer.DoneInfo) {
+			if info.Err != nil {
+				fbLog.Error("Picked SubConn errored, disabling for now", "addr", picked.addr, "err", info.Err)
+
+				p.fb.update(picked.sc, false)
+			}
+		},
+		Metadata: metadata.MD{"target": []string{picked.addr}},
 	}, nil
+}
+
+// UsedEndpointInterceptor is a gRPC client-side interceptor that provides reporting for which endpoint is being used by each RPC.
+func UsedEndpointInterceptor(l logger) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		usedEndpoint := grpc.PeerCallOption{PeerAddr: &peer.Peer{}}
+		opts = append(opts, usedEndpoint)
+		err := invoker(ctx, method, req, reply, cc, opts...)
+		l.Info("", "endpoint", usedEndpoint.PeerAddr.String())
+		return err
+	}
 }

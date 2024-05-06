@@ -60,8 +60,6 @@ func main() {
 	}
 	defer client.Close()
 
-	// register client metrics
-	ClientMetrics.Register(client.GetMetrics())
 	go serveMetrics()
 
 	slog.Info("Starting http relay", "version", version, "client", client)
