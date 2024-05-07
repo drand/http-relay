@@ -92,10 +92,6 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		log:          l,
 	}
 
-	// TODO: this is probably not the right place to setup the grpc monitoring server?
-	// or should its address be just another of NewClient arguments?
-	startMonitoringServer("127.0.0.1:7555")
-
 	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms checkTimeout built-in above
 	_, err = client.GetChains(context.Background())
 	return client, err
@@ -166,7 +162,8 @@ func (c *Client) Watch(ctx context.Context, m *proto.Metadata) <-chan *HexBeacon
 	return ch
 }
 
-// Check is returning the latest beacon and the chain info for the requested chainhash or beacon ID in the provided Metadata
+// Check is relying on GRPC default health reporting service, it does not indicate whether a node is behind or not,
+// only whether a node is currently up or not.
 func (c *Client) Check(ctx context.Context) error {
 	c.log.Debug("Client Check")
 

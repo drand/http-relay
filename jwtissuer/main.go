@@ -21,14 +21,14 @@ var (
 func init() {
 	flag.Parse()
 	// TODO: consider migrating to AWS secret manager
-	secret, provided := os.LookupEnv("AUTH_TOKEN")
+	secret, provided := os.LookupEnv("DRAND_AUTH_KEY")
 	if !provided {
 		secret = flag.Arg(0)
 	} else {
-		slog.Error("Using AUTH_TOKEN var env, ignoring binary arguments")
+		slog.Error("Using DRAND_AUTH_KEY var env, ignoring binary arguments")
 	}
 	if len(secret) < 256 {
-		log.Fatal("AUTH_TOKEN not provided as a 128 byte hex-encoded secret in argument. Got ", len(secret), " char: ", secret)
+		log.Fatal("DRAND_AUTH_KEY not provided as a 128 byte hex-encoded secret in argument. Got ", len(secret), " char: ", secret)
 	} else {
 		var err error
 		jwtSecret, err = hex.DecodeString(secret)

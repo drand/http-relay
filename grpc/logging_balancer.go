@@ -98,8 +98,6 @@ func (w *wrappedClientConn) NewSubConn(addrs []resolver.Address, opts balancer.N
 	sb, err := w.ClientConn.NewSubConn([]resolver.Address{addr}, nOpts)
 	if err != nil {
 		w.log.Error("NewSubConn errored", "err", err)
-
-		return sb, err
 	}
 	return sb, err
 }

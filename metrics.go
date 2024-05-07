@@ -46,15 +46,21 @@ func serveMetrics() {
 		EnableOpenMetrics: true,
 	})
 
+	mClient, err := grpc.CreateChannelzMonitor()
+	if err != nil {
+		slog.Error("error creating channelz monitor", "err", err)
+		return
+	}
+
 	slog.Info("starting to serve metrics on localhost:9999/metrics")
 	http.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("serving metrics on localhost:9999/metrics")
-		grpc.UpdateMetrics()
+		grpc.UpdateMetrics(mClient)
 		handler.ServeHTTP(w, r)
 	}))
-	err := http.ListenAndServe(*metricFlag, nil) //nolint:gosec // Ignoring G114
-	if err != nil {
-		slog.Error("error serving http metrics on %q: %v", *metricFlag, err)
+	//nolint:gosec // Ignoring G114
+	if err := http.ListenAndServe(*metricFlag, nil); err != nil {
+		slog.Error("error serving http metrics", "addr", *metricFlag, "err", err)
 		return
 	}
 }
