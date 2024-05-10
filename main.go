@@ -161,6 +161,8 @@ func setup(client *grpc.Client) http.Handler {
 	//// Only 5 requests will be processed at a time.
 	//r.Use(middleware.Throttle(5))
 
+	r.Get("/public/18446744073709551615", sendMaxInt())
+
 	// v2 with ACL protected routes with shared grpc client
 	r.Group(func(r chi.Router) {
 		// JWT authentication, tokens to be issued using the jwtissuer binary
