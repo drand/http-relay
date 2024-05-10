@@ -52,11 +52,15 @@ func serveMetrics() {
 		return
 	}
 
-	slog.Info("starting to serve metrics on localhost:9999/metrics")
+	slog.Info("starting to serve metrics on /metrics")
 	http.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		slog.Debug("serving metrics on localhost:9999/metrics")
+		slog.Debug("serving metrics on /metrics")
 		grpc.UpdateMetrics(mClient)
 		handler.ServeHTTP(w, r)
+	}))
+	http.Handle("/chanz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		slog.Debug("display channelz data on /chanz")
+		w.Write([]byte(grpc.UpdateMetrics(mClient)))
 	}))
 	//nolint:gosec // Ignoring G114
 	if err := http.ListenAndServe(*metricFlag, nil); err != nil {

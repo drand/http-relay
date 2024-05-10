@@ -44,7 +44,7 @@ type LBConfig struct {
 
 // NewFallbackBuilder returns a fallback balancer builder configured with the given timeout, meant to be registered.
 func NewFallbackBuilder(timeout time.Duration) balancer.Builder {
-	fbLog.Error("building fallback balancer", "timeout", timeout)
+	fbLog.Info("building balancer", "timeout", timeout)
 
 	return &fallbackBB{
 		timeout: timeout,
@@ -97,6 +97,7 @@ func (fb *fallbackBalancer) run(timeout time.Duration) {
 			fb.mu.Unlock()
 			ticker.Reset(timeout)
 		case <-fb.closing:
+			fbLog.Info("received a Close, shutting down fallback balancer")
 			fb.mu.Lock()
 			ticker.Stop()
 			// we empty the balancer
@@ -104,7 +105,7 @@ func (fb *fallbackBalancer) run(timeout time.Duration) {
 				delete(fb.scAddrs, sc)
 			}
 			fb.mu.Unlock()
-			// now we call the underlying balancer Close()
+			// now we call the underlying balancer Close() managing the actual SubConn
 			fb.Balancer.Close()
 			return
 		}
@@ -279,11 +280,11 @@ func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 	skip, _ := b.Ctx.Value(SkipCtxKey{}).(bool)
 
 	first, second := p.fb.firstTwoReady()
-	fbLog.Error("considering to pick", "first", first, "second", second, "skip", skip)
+	fbLog.Info("considering to pick", "first", first, "second", second, "skip", skip)
 	picked := first
 	// we got a skip context, so we'll try to see if there is a next subconn
 	if skip && second != nil {
-		fbLog.Error("skipping & disabling SubConn", "addr", first.addr, "order", first.order)
+		fbLog.Error("skipping & disabling SubConn for now", "addr", first.addr, "order", first.order)
 		p.fb.update(first.sc, false)
 		picked = second
 	}
