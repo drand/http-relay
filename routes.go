@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/drand/drand/v2/common"
@@ -50,6 +51,14 @@ func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			slog.Error("[GetBeacon] error retrieving chain info from primary client", "error", err)
 			// we will skip cache-age setting, something is wrong
 			w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+			if errors.Is(err, context.Canceled) {
+				http.Error(w, "timeout", http.StatusGatewayTimeout)
+			} else if strings.Contains(err.Error(), "unknown chain hash") {
+				http.Error(w, "unknown chain hash", http.StatusBadRequest)
+			} else {
+				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
+			}
+			return
 		}
 
 		nextTime, nextRound := info.ExpectedNext()
