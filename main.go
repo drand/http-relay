@@ -32,7 +32,7 @@ var (
 	verbose     = flag.Bool("verbose", false, "Prints as many logs as possible.")
 	jsonFlag    = flag.Bool("json", false, "Prints logs in JSON format.")
 	frontrun    = flag.Int64("frontrun", 0, "When waiting for the next round, start the query this amount of ms earlier to counteract network latency.")
-	_           = flag.String("insecure", "", "deprecated flag")
+	_           = flag.Bool("insecure", false, "deprecated flag")
 	_           = flag.String("hash-list", "", "deprecated flag")
 )
 
