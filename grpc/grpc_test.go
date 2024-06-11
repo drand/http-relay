@@ -6,47 +6,80 @@ import (
 )
 
 func TestNextBeaconTime(t *testing.T) {
-	now := time.Now().Unix()
+	clock = func() time.Time {
+		return time.Unix(1718110233, 0)
+	}
+
 	tests := []struct {
-		name         string
-		info         *JsonInfoV2
-		expectedTime int64
+		name          string
+		info          *JsonInfoV2
+		expectedTime  int64
+		expectedRound uint64
 	}{
 		{
-			"default",
+			"first",
 			&JsonInfoV2{
 				PublicKey:   HexBytes{00, 01, 02, 03, 04},
 				Period:      10,
-				GenesisTime: now - 25,
+				GenesisTime: clock().Unix() - 25,
 				GenesisSeed: []byte("test"),
 				Hash:        []byte("test"),
 				Scheme:      "test",
 				BeaconId:    "default",
 			},
-			now + 5,
+			clock().Unix() + 5,
+			3,
 		},
 		{
-			"quicknet",
+			"second",
 			&JsonInfoV2{
 				PublicKey:   HexBytes{00, 01, 02, 03, 04},
 				Period:      13,
-				GenesisTime: now - 33,
+				GenesisTime: clock().Unix() - 33,
 				GenesisSeed: []byte("test"),
 				Hash:        []byte("test"),
 				Scheme:      "test",
 				BeaconId:    "default",
 			},
-			now + 6,
+			clock().Unix() + 6,
+			3,
+		},
+		{
+			"mainnet-default",
+			&JsonInfoV2{
+				Period:      30,
+				GenesisTime: 1595431050,
+			},
+			1718110260,
+			4089308,
+		},
+		{
+			"now",
+			&JsonInfoV2{
+				Period:      30,
+				GenesisTime: 1718110233,
+			},
+			1718110263,
+			1,
+		},
+		{
+			"now",
+			&JsonInfoV2{
+				Period:      30,
+				GenesisTime: 1718110200,
+			},
+			1718110260,
+			2,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, got1 := tt.info.ExpectedNext()
+			got, gotr := tt.info.ExpectedNext()
 			if got != tt.expectedTime {
-				t.Errorf("NextBeaconTime() got = %v, want %v", got, tt.expectedTime)
+				t.Errorf("unexpect next time: got = %v, want %v", got, tt.expectedTime)
 			}
-			if got1 != 3 {
-				t.Errorf("NextBeaconTime() got1 = %v, want %v", got1, 3)
+			if gotr != tt.expectedRound {
+				t.Errorf("unexpected next round: got = %v, want %v", gotr, tt.expectedRound)
 			}
 		})
 	}

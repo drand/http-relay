@@ -22,11 +22,14 @@ import (
 	"google.golang.org/protobuf/protoadapt"
 )
 
+var clock func() time.Time
+
 func init() {
 	balancer.Register(NewFallbackBuilder(3 * time.Second))
 	// registers the logging_pick_first_with_fallback balancer
 	balancer.Register(NewLoggingBalancerBuilder("pick_first_with_fallback", slog.With("service", "balancer")))
 	bindMetrics()
+	clock = time.Now
 }
 
 type logger interface {
@@ -225,8 +228,9 @@ func NewInfoV2(resp *proto.ChainInfoPacket) *JsonInfoV2 {
 func (info *JsonInfoV2) ExpectedNext() (expectedTime int64, expectedRound uint64) {
 	p := int64(info.Period)
 	// we rely on integer division rounding down, plus one because round 1 happened at GenesisTime
-	expected := ((time.Now().Unix() - info.GenesisTime) / p) + 1
-	return expected*p + info.GenesisTime, uint64(expected)
+	current := ((clock().Unix() - info.GenesisTime) / p) + 1
+	// current + 1 is the next round, but the off by one gives us the correct time
+	return current*p + info.GenesisTime, uint64(current) + 1
 }
 
 func (j *JsonInfoV2) V1() *JsonInfoV1 {
