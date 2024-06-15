@@ -21,8 +21,7 @@ func AddAuth(next http.Handler) http.Handler {
 
 	jwtSecret, err := hex.DecodeString(token)
 	if err != nil {
-		slog.Error("unable to parse DRAND_AUTH_KEY as valid hex, disabling authenticated API")
-		return next
+		log.Fatal("unable to parse DRAND_AUTH_KEY as valid hex, disabling authenticated API")
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
