@@ -62,8 +62,18 @@ type logPicker struct {
 
 func (p *logPicker) Pick(i balancer.PickInfo) (balancer.PickResult, error) {
 	result, err := p.sub.Pick(i)
-	p.log.Info("Pick", "endpoint", result.SubConn, "rpc", i.FullMethodName, "md", result.Metadata, "err", err)
-	return result, err
+
+	p.log.Debug("Pick", "endpoint", result.SubConn, "rpc", i.FullMethodName, "md", result.Metadata, "err", err)
+	return balancer.PickResult{
+		SubConn: result.SubConn,
+		Done: func(info balancer.DoneInfo) {
+			if info.Err != nil {
+				p.log.Error("Picked SubConn errored", "err", info.Err)
+			}
+			result.Done(info)
+		},
+		Metadata: result.Metadata,
+	}, err
 }
 
 type wrappedClientConn struct {

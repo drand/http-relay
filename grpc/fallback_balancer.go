@@ -89,10 +89,10 @@ func (fb *fallbackBalancer) run(timeout time.Duration) {
 		select {
 		case <-ticker.C:
 			fb.mu.Lock()
-			// every tick, we reset the state of all subconn, the ones whose underlying SubConn is actually not working
-			// are deleted from that list
+			// every tick, we reset the priority of all subconn, the ones whose underlying SubConn is actually not READY
+			// are deleted from that list anyway in UpdateClientConnState.
 			for _, sc := range fb.scAddrs {
-				sc.ready = true
+				sc.priority = sc.order
 			}
 			fb.mu.Unlock()
 			ticker.Reset(timeout)
@@ -116,28 +116,51 @@ func (fb *fallbackBalancer) Close() {
 	close(fb.closing)
 }
 
-func (fb *fallbackBalancer) update(sc balancer.SubConn, ready bool) {
+func (fb *fallbackBalancer) dec(sc balancer.SubConn) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	if sca, ok := fb.scAddrs[sc]; !ok {
 		fbLog.Error("trying to update state on a non-existent subconn", "subconn", sc)
 	} else {
-		sca.ready = ready
+		// -2 to increase the chance of having another higher priority conn available
+		sca.priority = sca.priority - 2
 	}
 }
 
-func (fb *fallbackBalancer) firstTwoReady() (*scWithAddr, *scWithAddr) {
+func (fb *fallbackBalancer) first() *scWithAddr {
 	fb.mu.RLock()
 	defer fb.mu.RUnlock()
-	ret := make([]*scWithAddr, 2, len(fb.scAddrs)+2)
+	// quick path for the case with a single subconn
+	if len(fb.scAddrs) == 1 {
+		for _, sca := range fb.scAddrs {
+			return sca
+		}
+	}
+	// in case scAddrs is empty, we need at least 1 nil and 1 cap
+	ret := make([]*scWithAddr, 1, len(fb.scAddrs)+1)
 	for _, sca := range fb.scAddrs {
-		if sca.ready && sca.order >= 0 {
+		ret = insert(ret, sca)
+	}
+
+	return ret[0]
+}
+
+func (fb *fallbackBalancer) second() *scWithAddr {
+	fb.mu.RLock()
+	defer fb.mu.RUnlock()
+	// quick path for the case with a single subconn or none
+	if len(fb.scAddrs) < 2 {
+		return nil
+	}
+	ret := make([]*scWithAddr, 0, len(fb.scAddrs))
+	for _, sca := range fb.scAddrs {
+		if sca.priority >= 0 {
 			// we insert in correct order, by priority
 			ret = insert(ret, sca)
 		}
 	}
 
-	return ret[0], ret[1]
+	return ret[1]
 }
 
 func (fb *fallbackBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
@@ -156,7 +179,7 @@ func (fb *fallbackBalancer) UpdateClientConnState(s balancer.ClientConnState) er
 		}
 		fb.mu.Unlock()
 		fbLog.Warning("resolver provided zero addresses")
-		// TODO: is this true:
+		// TODO: is this true?
 		// it's important to shutdown all SubConn above since ResolverError relies on len(ReadySC) to re-resolve
 		fb.Balancer.ResolverError(fmt.Errorf("resolver provided zero addresses"))
 		return balancer.ErrBadResolverState
@@ -169,14 +192,14 @@ type scWithAddr struct {
 	sc balancer.SubConn
 	// the underlying target's address
 	addr string
-	// whether this SubConn is currently considered ready or not
-	ready bool
+	// whether this SubConn is currently considered ready or not. Negative priority disables it.
+	priority int
 	// order is used to prioritze the SubConn to use, a negative one leads to it not being used at all
 	order int
 }
 
 func (s *scWithAddr) String() string {
-	return fmt.Sprintf("%d-%s-%v", s.order, s.addr, s.ready)
+	return fmt.Sprintf("%d/%d-%s", s.priority, s.order, s.addr)
 }
 
 // scCmp should return 0 if the slice element s matches
@@ -191,7 +214,7 @@ func scCmp(s, t *scWithAddr) int {
 	} else if t == nil {
 		return -1
 	}
-	return s.order - t.order
+	return s.priority - t.priority
 }
 
 // insert will insert s in scs in a sorted way, relying on the above comparison function. It will be in ascending order.
@@ -234,10 +257,10 @@ func (fb *fallbackBalancer) Build(info base.PickerBuildInfo) balancer.Picker {
 		}
 
 		sca := &scWithAddr{
-			sc:    sc,
-			addr:  addr.Address.Addr,
-			ready: true,
-			order: order,
+			sc:       sc,
+			addr:     addr.Address.Addr,
+			priority: order,
+			order:    order,
 		}
 
 		fbLog.Info("Processing Ready SubConn", "addr", addr.Address, "order", order)
@@ -262,12 +285,9 @@ func (p *picker) String() string {
 	}
 	var sb strings.Builder
 	sb.WriteString("[ ")
-	first, second := p.fb.firstTwoReady()
+	first := p.fb.first()
 	if first != nil {
 		sb.WriteString(first.String() + "; ")
-	}
-	if second != nil {
-		sb.WriteString(second.String() + "; ")
 	}
 	sb.WriteString("]")
 	return sb.String()
@@ -279,14 +299,16 @@ func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 	// we rely on the 0 value of int being 0 when the key isn't set
 	skip, _ := b.Ctx.Value(SkipCtxKey{}).(bool)
 
-	first, second := p.fb.firstTwoReady()
-	fbLog.Info("considering to pick", "first", first, "second", second, "skip", skip)
-	picked := first
+	picked := p.fb.first()
+	fbLog.Info("considering to pick", "first", picked, "skip", skip)
 	// we got a skip context, so we'll try to see if there is a next subconn
-	if skip && second != nil {
-		fbLog.Error("skipping & disabling SubConn for now", "addr", first.addr, "order", first.order)
-		p.fb.update(first.sc, false)
-		picked = second
+	if skip {
+		second := p.fb.second()
+		if second != nil {
+			fbLog.Error("skipping & deprioritizing first SubConn for now", "addr", picked.addr, "new_priority", picked.priority-1)
+			p.fb.dec(picked.sc)
+			picked = second
+		}
 	}
 
 	if picked == nil {
@@ -302,9 +324,7 @@ func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 		SubConn: picked.sc,
 		Done: func(info balancer.DoneInfo) {
 			if info.Err != nil {
-				fbLog.Error("Picked SubConn errored, disabling for now", "addr", picked.addr, "err", info.Err)
-
-				p.fb.update(picked.sc, false)
+				p.fb.dec(picked.sc)
 			}
 		},
 		Metadata: metadata.MD{"target": []string{picked.addr}},

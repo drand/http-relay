@@ -157,8 +157,8 @@ func GetHealth(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			return
 		}
 
-		_, expected := info.ExpectedNext()
-		if expected-1 > latest.Round {
+		_, next := info.ExpectedNext()
+		if next-2 > latest.Round {
 			// we force a retry with another backend if we see a discrepancy in case that backend is stuck on a old latest beacon
 			slog.Debug("GetHealth forcing retry with other SubConn")
 			ctx := context.WithValue(r.Context(), grpc.SkipCtxKey{}, true)
@@ -170,15 +170,16 @@ func GetHealth(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			}
 		}
 
-		if expected-1 == latest.Round {
+		if latest.Round >= next-2 {
 			w.WriteHeader(http.StatusOK)
 		} else {
+			slog.Debug("[GetHealth] http.StatusServiceUnavailable", "current", latest.Round, "expected", next-1)
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 
 		resp := make(map[string]uint64)
 		resp["current"] = latest.Round
-		resp["expected"] = expected
+		resp["expected"] = next - 1
 
 		json, err := json.Marshal(resp)
 		if err != nil {
