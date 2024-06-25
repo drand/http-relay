@@ -29,7 +29,7 @@ func DisplayRoutes(allRoutes []byte) func(http.ResponseWriter, *http.Request) {
 	}
 }
 
-func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
+func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		m, err := createRequestMD(r)
 		if err != nil {
@@ -81,6 +81,11 @@ func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
 				return
 			}
+		}
+
+		// for now the V2 drand nodes are still providing randomness
+		if !isV2 {
+			beacon.SetRandomness()
 		}
 
 		json, err := json.Marshal(beacon)

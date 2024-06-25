@@ -180,12 +180,12 @@ func setup(client *grpc.Client) http.Handler {
 
 			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/info", GetInfoV2(client))
 			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/health", GetHealth(client))
-			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/{round:\\d+}", GetBeacon(client))
+			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/{round:\\d+}", GetBeacon(client, true))
 			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/latest", GetLatest(client))
 
 			r.Get("/{beaconID}/info", GetInfoV2(client))
 			r.Get("/{beaconID}/health", GetHealth(client))
-			r.Get("/{beaconID}/{round:\\d+}", GetBeacon(client))
+			r.Get("/{beaconID}/{round:\\d+}", GetBeacon(client, true))
 			r.Get("/{beaconID}/latest", GetLatest(client))
 
 		})
@@ -197,15 +197,16 @@ func setup(client *grpc.Client) http.Handler {
 		r.Use(addCommonHeaders)
 
 		r.Use(apiVersionCtx("v1"))
+
 		r.Get("/chains", GetChains(client))
 		r.Get("/info", GetInfoV1(client))
 		r.Get("/health", GetHealth(client))
 
 		r.Get("/public/latest", GetLatest(client))
-		r.Get("/public/{round:\\d+}", GetBeacon(client))
+		r.Get("/public/{round:\\d+}", GetBeacon(client, false))
 
 		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/public/latest", GetLatest(client))
-		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/public/{round:\\d+}", GetBeacon(client))
+		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/public/{round:\\d+}", GetBeacon(client, false))
 		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/info", GetInfoV1(client))
 		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/health", GetHealth(client))
 	})

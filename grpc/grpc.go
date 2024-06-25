@@ -142,7 +142,7 @@ func (c *Client) Watch(ctx context.Context, m *proto.Metadata) <-chan *HexBeacon
 	ch := make(chan *HexBeacon, 1)
 	if err != nil {
 		close(ch)
-		return nil
+		return ch
 	}
 	go func() {
 		defer close(ch)

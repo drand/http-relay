@@ -3,6 +3,8 @@ package grpc
 import (
 	"encoding/hex"
 	"encoding/json"
+
+	"github.com/drand/drand/v2/crypto"
 )
 
 // HexBeacon is a struct that get marshaled into hex-encoded signatures and randomness in JSON
@@ -16,6 +18,15 @@ type HexBeacon struct {
 func (h *HexBeacon) GetRound() uint64 {
 	return h.Round
 }
+
+func (h *HexBeacon) SetRandomness() {
+	h.Randomness = crypto.RandomnessFromSignature(h.Signature)
+}
+
+func (h *HexBeacon) UnsetRandomness() {
+	h.Randomness = nil
+}
+
 func (h *HexBeacon) GetRandomness() []byte {
 	return h.Randomness
 }
@@ -39,7 +50,6 @@ func NewHexBeacon(beacon RandomData) *HexBeacon {
 		Round:             beacon.GetRound(),
 		Signature:         beacon.GetSignature(),
 		PreviousSignature: beacon.GetPreviousSignature(),
-		Randomness:        beacon.GetRandomness(),
 	}
 }
 
