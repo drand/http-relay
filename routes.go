@@ -83,7 +83,7 @@ func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Reques
 			}
 		}
 
-		// for now the V2 drand nodes are still providing randomness
+		// we need to set the randomness since the nodes are not sending it over the wire anymore
 		if !isV2 {
 			beacon.SetRandomness()
 		}
