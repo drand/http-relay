@@ -20,7 +20,6 @@ var (
 
 func init() {
 	flag.Parse()
-	// TODO: consider migrating to AWS secret manager
 	secret, provided := os.LookupEnv("DRAND_AUTH_KEY")
 	if !provided {
 		secret = flag.Arg(0)

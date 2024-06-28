@@ -140,13 +140,12 @@ func setup(client *grpc.Client) http.Handler {
 		LogLevel:        getLogLevel(),
 		Concise:         !(*verbose),
 		ResponseHeaders: *verbose,
-		// TimeFieldFormat: time.RFC850,
-		// RequestHeaders:  true, // not supported by our logger
-		// QuietDownRoutes: []string{ // not supported by our logger
-		//	 "/",
-		//	 "/ping",
-		// },
-		// QuietDownPeriod: 1 * time.Second, // not supported by our logger
+		RequestHeaders:  false,
+		QuietDownRoutes: []string{
+			"/",
+			"/ping",
+		},
+		QuietDownPeriod: 1 * time.Second,
 	})
 	// this also setups Request ID and Panic recoverer middleware behind the hood
 	r.Use(httplog.RequestLogger(logger))
@@ -159,10 +158,6 @@ func setup(client *grpc.Client) http.Handler {
 		// or not by Chi against a given route.
 		r.Use(trackRoute)
 	}
-
-	// For now, rate-limiting is left to the nginx reverse proxy...
-	//// Only 5 requests will be processed at a time.
-	//r.Use(middleware.Throttle(5))
 
 	r.Get("/public/18446744073709551615", sendMaxInt())
 
