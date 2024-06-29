@@ -83,8 +83,11 @@ func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Reques
 			}
 		}
 
-		// we need to set the randomness since the nodes are not sending it over the wire anymore
-		if !isV2 {
+		if isV2 {
+			// we make sure that the V2 api aren't marshaling randommness
+			beacon.UnsetRandomness()
+		} else {
+			// we need to set the randomness since the nodes are not supposed to send it over the wire anymore
 			beacon.SetRandomness()
 		}
 

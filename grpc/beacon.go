@@ -46,10 +46,16 @@ type RandomData interface {
 }
 
 func NewHexBeacon(beacon RandomData) *HexBeacon {
+	var rand []byte
+	if beacon.GetRandomness() != nil {
+		rand = beacon.GetRandomness()
+	}
+
 	return &HexBeacon{
 		Round:             beacon.GetRound(),
 		Signature:         beacon.GetSignature(),
 		PreviousSignature: beacon.GetPreviousSignature(),
+		Randomness:        rand,
 	}
 }
 

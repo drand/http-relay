@@ -61,7 +61,6 @@ func (fallbackBB) Name() string {
 
 func (f fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Balancer {
 	b := &fallbackBalancer{scAddrs: make(map[balancer.SubConn]*scWithAddr), closing: make(chan struct{})}
-	go b.run(f.timeout)
 	// we delegate the actual SubConn management to the base balancer
 	baseBuilder := base.NewBalancerBuilder(fallbackName, b,
 		base.Config{
@@ -69,6 +68,7 @@ func (f fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) b
 			HealthCheck: false,
 		})
 	b.Balancer = baseBuilder.Build(cc, bOpts)
+	go b.runBackgroundTimer(f.timeout)
 	return b
 }
 
@@ -83,7 +83,7 @@ type fallbackBalancer struct {
 }
 
 // Function to continuously process updates
-func (fb *fallbackBalancer) run(timeout time.Duration) {
+func (fb *fallbackBalancer) runBackgroundTimer(timeout time.Duration) {
 	ticker := time.NewTimer(timeout)
 	for {
 		select {
@@ -106,6 +106,8 @@ func (fb *fallbackBalancer) run(timeout time.Duration) {
 			}
 			fb.mu.Unlock()
 			// now we call the underlying balancer Close() managing the actual SubConn
+			// this is the one that will be calling Shutdown on each SubConn
+			// as will be mandated in a future go-grpc release.
 			fb.Balancer.Close()
 			return
 		}
@@ -127,6 +129,8 @@ func (fb *fallbackBalancer) dec(sc balancer.SubConn) {
 	}
 }
 
+// first returns the subconn with the highest priority among the ones available.
+// It can return a nil subconn if none are ready, this must be handled by the caller.
 func (fb *fallbackBalancer) first() *scWithAddr {
 	fb.mu.RLock()
 	defer fb.mu.RUnlock()
@@ -139,6 +143,7 @@ func (fb *fallbackBalancer) first() *scWithAddr {
 	// in case scAddrs is empty, we need at least 1 nil and 1 cap
 	ret := make([]*scWithAddr, 1, len(fb.scAddrs)+1)
 	for _, sca := range fb.scAddrs {
+		// we insert in correct order, by priority
 		ret = insert(ret, sca)
 	}
 
@@ -154,10 +159,8 @@ func (fb *fallbackBalancer) second() *scWithAddr {
 	}
 	ret := make([]*scWithAddr, 0, len(fb.scAddrs))
 	for _, sca := range fb.scAddrs {
-		if sca.priority >= 0 {
-			// we insert in correct order, by priority
-			ret = insert(ret, sca)
-		}
+		// we insert in correct order, by priority
+		ret = insert(ret, sca)
 	}
 
 	return ret[1]
