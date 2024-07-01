@@ -37,6 +37,26 @@ func TestEncodeBeacon(t *testing.T) {
 	assert.Contains(t, string(json), "\"randomness\":")
 }
 
+func TestUmarshal(t *testing.T) {
+	jsonStr := `{"round":699349,"randomness":"19dcce6d274878de3256272cb2476e82f1d0ae197e86fb076ba7537c89e66cc0","signature":"8ca93e637e34c1ac7f7f3342e76c3c876091a68d16e794c53b54f456d366860021de57eb55f6a81ccc58c8b89e0d793e0717628b9b96552433516d9d55932607f25b71ca60e32bef258a746854ff752c4666dc0c65a96a499331ac8ad4207012","previous_signature":"b8cffba5fe405384c79a4eb6a6287ce3345228b06c398d1bb1836002b48a738247150295c60044c823454fb9d6b06b870065c84c18ce5862964c0566662c83e8e92ba62799cb40d126b0b69556233b70238d834e9c130e34166fa200fcba859d"}`
+	sRand := "19dcce6d274878de3256272cb2476e82f1d0ae197e86fb076ba7537c89e66cc0"
+	bRand, err := hex.DecodeString(sRand)
+	require.NoError(t, err)
+
+	sSig := "8ca93e637e34c1ac7f7f3342e76c3c876091a68d16e794c53b54f456d366860021de57eb55f6a81ccc58c8b89e0d793e0717628b9b96552433516d9d55932607f25b71ca60e32bef258a746854ff752c4666dc0c65a96a499331ac8ad4207012"
+	bSig, err := hex.DecodeString(sSig)
+	require.NoError(t, err)
+	beacon := new(HexBeacon)
+	err = json.Unmarshal([]byte(jsonStr), beacon)
+	require.NoError(t, err)
+	require.Equal(t, uint64(699349), beacon.Round)
+	require.Equal(t, bRand, beacon.GetRandomness())
+	require.Equal(t, bSig, beacon.GetSignature())
+	// computes and overwrite the randomness value
+	beacon.SetRandomness()
+	require.Equal(t, beacon.GetRandomness(), bRand)
+}
+
 func TestEncodeWeirdBeacons(t *testing.T) {
 	tests := []struct {
 		name   string
