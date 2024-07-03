@@ -110,5 +110,5 @@ func getLogLevel() slog.Level {
 	if *verbose {
 		return slog.LevelDebug
 	}
-	return slog.LevelWarn
+	return slog.LevelInfo
 }
