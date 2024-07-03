@@ -92,7 +92,7 @@ func (fb *fallbackBalancer) runBackgroundTimer(timeout time.Duration) {
 			// every tick, we reset the priority of all subconn, the ones whose underlying SubConn is actually not READY
 			// are deleted from that list anyway in UpdateClientConnState.
 			for _, sc := range fb.scAddrs {
-				sc.priority = sc.order
+				sc.ResetPriority()
 			}
 			fb.mu.Unlock()
 			ticker.Reset(timeout)
@@ -125,7 +125,7 @@ func (fb *fallbackBalancer) dec(sc balancer.SubConn) {
 		fbLog.Error("trying to update state on a non-existent subconn", "subconn", sc)
 	} else {
 		// -2 to increase the chance of having another higher priority conn available
-		sca.priority = sca.priority - 2
+		sca.UpdatePriority(-2)
 	}
 }
 
@@ -197,12 +197,29 @@ type scWithAddr struct {
 	addr string
 	// whether this SubConn is currently considered ready or not. Negative priority disables it.
 	priority int
-	// order is used to prioritze the SubConn to use, a negative one leads to it not being used at all
+	// order is used to prioritize the SubConn to use, a negative one leads to it not being used at all
 	order int
+
+	// we can have concurrent updates of the priority, so we need to guard our scWithAddr with a mutex
+	mu sync.RWMutex
 }
 
 func (s *scWithAddr) String() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return fmt.Sprintf("%d/%d-%s", s.priority, s.order, s.addr)
+}
+
+func (s *scWithAddr) ResetPriority() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.priority = s.order
+}
+
+func (s *scWithAddr) UpdatePriority(update int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.priority += update
 }
 
 // scCmp should return 0 if the slice element s matches
@@ -217,6 +234,8 @@ func scCmp(s, t *scWithAddr) int {
 	} else if t == nil {
 		return -1
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.priority - t.priority
 }
 
@@ -308,7 +327,7 @@ func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 	if skip {
 		second := p.fb.second()
 		if second != nil {
-			fbLog.Error("skipping & deprioritizing first SubConn for now", "addr", picked.addr, "new_priority", picked.priority-1)
+			fbLog.Error("skipping & deprioritizing first SubConn for now", "addr", picked.addr)
 			p.fb.dec(picked.sc)
 			picked = second
 		}

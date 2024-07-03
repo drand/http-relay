@@ -24,8 +24,10 @@ import (
 
 var clock func() time.Time
 
+var FallbackTimeout = 3 * time.Second
+
 func init() {
-	balancer.Register(NewFallbackBuilder(3 * time.Second))
+	balancer.Register(NewFallbackBuilder(FallbackTimeout))
 	// registers the logging_pick_first_with_fallback balancer
 	balancer.Register(NewLoggingBalancerBuilder("pick_first_with_fallback", slog.With("service", "balancer")))
 	bindMetrics()
@@ -40,19 +42,19 @@ type logger interface {
 }
 
 // Client represent a drand GRPC client, it connects to a single node at serverAddr, stores the connection in conn
-// it has a knownChains map of known chain info keyed using the hex-encoded chainhash of a beacon chain. The checkTimeout
+// it has a knownChains map of known chain info keyed using the hex-encoded chainhash of a beacon chain. The healthTimeout
 // is used for health checks only currently.
 type Client struct {
-	conn         *grpc.ClientConn
-	pc           proto.PublicClient
-	serverAddr   string
-	knownChains  sync.Map
-	checkTimeout time.Duration
-	log          logger
+	conn          *grpc.ClientConn
+	pc            proto.PublicClient
+	serverAddr    string
+	knownChains   sync.Map
+	healthTimeout time.Duration
+	log           logger
 }
 
 // NewClient establishes a new non-TLS grpc connection to the provided server address. It takes a logger and uses
-// a default value for checkTimeout.
+// a default value for healthTimeout.
 func NewClient(serverAddr string, l logger) (*Client, error) {
 	l.Debug("NewClient", "serverAddr", serverAddr)
 
@@ -74,7 +76,7 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first_with_fallback"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
-			// TODO: do we really want a 500ms default checkTimeout on unary RPC?
+			// TODO: do we really want a 500ms default healthTimeout on unary RPC?
 			timeout.UnaryClientInterceptor(500*time.Millisecond),
 			clMetrics.UnaryClientInterceptor(),
 			UsedEndpointInterceptor(l),
@@ -88,27 +90,28 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		l.Error("Unable to Dial", "err", err)
 	}
 	client := &Client{
-		conn:         conn,
-		pc:           proto.NewPublicClient(conn),
-		serverAddr:   serverAddr,
-		checkTimeout: 3 * time.Second,
-		log:          l,
+		conn:          conn,
+		pc:            proto.NewPublicClient(conn),
+		serverAddr:    serverAddr,
+		healthTimeout: time.Second,
+		log:           l,
 	}
 
-	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms checkTimeout built-in above
+	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms healthTimeout built-in above
 	_, err = client.GetChains(context.Background())
 	return client, err
 }
 
-// SetTimeout allows to set your own checkTimeout for GRPC health checks.
+// SetTimeout allows to set your own healthTimeout for GRPC health checks.
 func (c *Client) SetTimeout(timeout time.Duration) {
 	c.log.Debug("Client SetTimeout")
 
-	c.checkTimeout = timeout
+	c.healthTimeout = timeout
 }
 
 func (c *Client) Close() error {
 	c.log.Debug("Client Closing")
+
 	return c.conn.Close()
 }
 
@@ -172,7 +175,7 @@ func (c *Client) Check(ctx context.Context) error {
 
 	client := healthgrpc.NewHealthClient(c.conn)
 
-	tctx, cancel := context.WithTimeout(ctx, c.checkTimeout)
+	tctx, cancel := context.WithTimeout(ctx, c.healthTimeout)
 	defer cancel()
 
 	resp, err := client.Check(tctx, &healthgrpc.HealthCheckRequest{})
@@ -292,26 +295,40 @@ func (c *Client) GetChainInfo(ctx context.Context, m *proto.Metadata) (*JsonInfo
 	return info, err
 }
 
-// GetChains returns an array of chain-hashes available on that grpc node. It does 1 ListBeaconIDs call and n calls to
-// get the ChainInfo, so it's a relatively noisy path.
-func (c *Client) GetChains(ctx context.Context) ([]string, error) {
-	c.log.Debug("Client GetChains")
+// GetBeaconIds returns an array
+func (c *Client) GetBeaconIds(ctx context.Context) ([]string, []*proto.Metadata, error) {
+	c.log.Debug("Client GetBeaconIds")
 
 	resp, err := c.pc.ListBeaconIDs(ctx, &proto.ListBeaconIDsRequest{})
 	if err != nil {
-		c.log.Error("client.ListBeaconIDs", "err", err)
-		return nil, err
+		c.log.Error("client.GetBeaconIds", "err", err)
+		return nil, nil, err
 	}
 
 	beaconIds := resp.GetIds()
 	metadatas := resp.GetMetadatas()
 
 	if len(beaconIds) != len(metadatas) {
-		return nil, fmt.Errorf("invalid response: received %d beacon IDs (%v) but %d metadata packets", len(beaconIds), beaconIds, len(metadatas))
+		return nil, nil, fmt.Errorf("invalid response: received %d beacon IDs (%v) but %d metadata packets", len(beaconIds), beaconIds, len(metadatas))
+	}
+
+	return beaconIds, metadatas, nil
+}
+
+// GetChains returns an array of chain-hashes available on that grpc node. It does 1 ListBeaconIDs call and n calls to
+// get the ChainInfo, so it's a relatively noisy path. It uses an internal sync.Map in the Client to keep a cache of
+// valid chain info data, since the chain infos are stable and do not change over time.
+func (c *Client) GetChains(ctx context.Context) ([]string, error) {
+	c.log.Debug("Client GetChains")
+
+	beaconIds, metadatas, err := c.GetBeaconIds(ctx)
+	if err != nil {
+		c.log.Error("client.ListBeaconIDs error when getting beacon IDs", "err", err)
+		return nil, err
 	}
 
 	chains := make([]string, 0, len(metadatas))
-	for _, meta := range metadatas {
+	for i, meta := range metadatas {
 		chain := meta.GetChainHash()
 		strChain := hex.EncodeToString(chain)
 		chains = append(chains, strChain)
@@ -329,12 +346,17 @@ func (c *Client) GetChains(ctx context.Context) ([]string, error) {
 			c.log.Error("invalid call to ChainInfo", "err", err)
 			return nil, err
 		}
+
 		hash := info.GetHash()
 		if !bytes.Equal(chain, hash) {
 			return nil, fmt.Errorf("invalid chainhash %q for chain %q", hash, chain)
 		}
 		c.knownChains.Store(strChain, NewInfoV2(info))
+
 		if id := info.GetMetadata().GetBeaconID(); id != "" {
+			if beaconIds[i] != id {
+				c.log.Warn("potential mismatch of beacon ID and chain hash", "metadata", info.GetMetadata(), "index", i, "beaconIds", beaconIds, "chain", strChain)
+			}
 			c.knownChains.Store(id, NewInfoV2(info))
 		}
 	}

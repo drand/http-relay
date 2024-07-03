@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"log/slog"
 	"net"
@@ -16,10 +15,6 @@ import (
 	"time"
 
 	"github.com/drand/http-server/grpc"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/httplog/v2"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -68,7 +63,7 @@ func main() {
 	slog.Info("Starting http relay", "version", version, "client", client)
 
 	// The HTTP Server
-	server := &http.Server{Addr: *httpBind, Handler: setup(client)}
+	server := &http.Server{Addr: *httpBind, Handler: drandHandler(client)}
 
 	// Server run context
 	serverCtx, serverStopCtx := context.WithCancel(context.Background())
@@ -109,149 +104,6 @@ func main() {
 	// Wait for server context to be stopped
 	<-serverCtx.Done()
 	slog.Info("drand http server stopped")
-}
-
-func prometheusMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fn := promhttp.InstrumentHandlerCounter(
-			HTTPCallCounter,
-			promhttp.InstrumentHandlerDuration(
-				HTTPLatency,
-				promhttp.InstrumentHandlerInFlight(
-					HTTPInFlight,
-					next)))
-		// We could also instrument:
-		// 	- time to write headers, but since we have common headers, these aren't too useful
-		//  - request size, but these are supposedly fixed size and are in the logs
-		fn.ServeHTTP(w, r)
-	})
-}
-
-func setup(client *grpc.Client) http.Handler {
-	// setup chi router
-	r := chi.NewRouter()
-
-	// putting the metric middleware first to get timing right
-	r.Use(prometheusMiddleware)
-
-	// setup logger middleware
-	logger := httplog.NewLogger("drand-http-relay", httplog.Options{
-		JSON:            *jsonFlag,
-		LogLevel:        getLogLevel(),
-		Concise:         !(*verbose),
-		ResponseHeaders: *verbose,
-		RequestHeaders:  false,
-		QuietDownRoutes: []string{
-			"/",
-			"/ping",
-		},
-		QuietDownPeriod: 1 * time.Second,
-	})
-	// this also setups Request ID and Panic recoverer middleware behind the hood
-	r.Use(httplog.RequestLogger(logger))
-
-	// setup ping endpoint for load balancers and uptime testing, without ACLs
-	r.Use(middleware.Heartbeat("/ping"))
-
-	if *verbose {
-		// when running in verbose mode, we have a special Debug log telling us for each request whether it was matched
-		// or not by Chi against a given route.
-		r.Use(trackRoute)
-	}
-
-	r.Get("/public/18446744073709551615", sendMaxInt())
-
-	// v2 with ACL protected routes with shared grpc client
-	r.Group(func(r chi.Router) {
-		// JWT authentication, tokens to be issued using the jwtissuer binary
-		if *requireAuth {
-			r.Use(AddAuth)
-		}
-		r.Use(apiVersionCtx("v2"))
-		r.Route("/v2", func(r chi.Router) {
-			// use our common headers for the following routes
-			r.Use(addCommonHeaders)
-			r.Get("/chains", GetChains(client))
-
-			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/info", GetInfoV2(client))
-			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/health", GetHealth(client))
-			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/{round:\\d+}", GetBeacon(client, true))
-			r.Get("/{chainhash:[0-9A-Fa-f]{64}}/latest", GetLatest(client))
-
-			r.Get("/{beaconID}/info", GetInfoV2(client))
-			r.Get("/{beaconID}/health", GetHealth(client))
-			r.Get("/{beaconID}/{round:\\d+}", GetBeacon(client, true))
-			r.Get("/{beaconID}/latest", GetLatest(client))
-
-		})
-	})
-
-	// v1 API
-	r.Group(func(r chi.Router) {
-		// use our common headers for the following routes
-		r.Use(addCommonHeaders)
-
-		r.Use(apiVersionCtx("v1"))
-
-		r.Get("/chains", GetChains(client))
-		r.Get("/info", GetInfoV1(client))
-		r.Get("/health", GetHealth(client))
-
-		r.Get("/public/latest", GetLatest(client))
-		r.Get("/public/{round:\\d+}", GetBeacon(client, false))
-
-		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/public/latest", GetLatest(client))
-		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/public/{round:\\d+}", GetBeacon(client, false))
-		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/info", GetInfoV1(client))
-		r.Get("/{chainhash:[0-9A-Fa-f]{64}}/health", GetHealth(client))
-	})
-
-	{
-		// we want to print all routes served by our chi router
-		allRoutes := &strings.Builder{}
-		// displays all existing routes in the CLI upon starting or calling /
-		walkFunc := func(method string, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error {
-			route = strings.Replace(route, "/*/", "/", -1)
-			fmt.Fprintf(allRoutes, "%s %s\n", method, route)
-			return nil
-		}
-		if err := chi.Walk(r, walkFunc); err != nil {
-			fmt.Printf("Logging err: %s\n", err.Error())
-		}
-		r.Get("/", DisplayRoutes([]byte(allRoutes.String())))
-	}
-
-	// we explicitly don't serve favicon
-	r.Get("/favicon.ico", http.NotFound)
-
-	return r
-}
-
-func trackRoute(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-		rctx := chi.RouteContext(r.Context())
-		routePattern := strings.Join(rctx.RoutePatterns, "")
-		slog.Debug("request matched", "route", routePattern)
-	})
-}
-
-func addCommonHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Server", version)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		next.ServeHTTP(w, r)
-	})
-}
-
-func apiVersionCtx(version string) func(next http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r = r.WithContext(context.WithValue(r.Context(), "api.version", version))
-			next.ServeHTTP(w, r)
-		})
-	}
 }
 
 func getLogLevel() slog.Level {
