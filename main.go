@@ -1,164 +1,114 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/drand/http-server/grpc"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/httplog/v2"
-	"github.com/golang-jwt/jwt/v5"
 )
 
-var version = "drand-http-server-v2.0.1"
+var (
+	version     = "drand-http-server-v2.0.1"
+	metricFlag  = flag.String("metrics", "localhost:9999", "The flag to set the interface for metrics. Defaults to localhost:9999")
+	httpBind    = flag.String("bind", "localhost:8080", "The address to bind the http server to")
+	grpcURL     = flag.String("grpc-connect", "localhost:4444", "The URL and port to your drand node's grpc port, e.g. pl1-rpc.testnet.drand.sh:443 you can add fallback nodes by separating them with a comma: pl1-rpc.testnet.drand.sh:443,pl2-rpc.testnet.drand.sh:443")
+	goVersion   = flag.Bool("version", false, "Displays the current server version.")
+	requireAuth = flag.Bool("enable-auth", false, "Forces JWT authentication on V2 API using the JWT secret from the AUTH_TOKEN env variable.")
+	verbose     = flag.Bool("verbose", false, "Prints as many logs as possible.")
+	jsonFlag    = flag.Bool("json", false, "Prints logs in JSON format.")
+	frontrun    = flag.Int64("frontrun", 0, "When waiting for the next round, start the query this amount of ms earlier to counteract network latency.")
+	_           = flag.Bool("insecure", false, "deprecated flag")
+	_           = flag.String("hash-list", "", "deprecated flag")
+)
+
+func init() {
+	flag.Parse()
+	slog.SetLogLoggerLevel(getLogLevel())
+	if *frontrun > 0 {
+		FrontrunTiming = time.Duration(*frontrun) * time.Millisecond
+	}
+}
 
 func main() {
-	grpcURL := flag.String("grpc", "localhost:7001", "The URL and port to your drand node's grpc port, e.g. pl1-rpc.testnet.drand.sh:443")
-	goVersion := flag.Bool("version", false, "Displays the current server version.")
-	flag.Parse()
 	if *goVersion {
 		log.Fatal("drand http server version: ", version)
 	}
-	log.Println("Starting with", "grpc", *grpcURL)
-	host, port, err := net.SplitHostPort(*grpcURL)
-	if err != nil {
-		log.Fatal("Unable to parse --grpc flag, please provide a valid one. Err: ", err)
-	}
 
-	log.Println("Starting ", version, " against GRPC node at ", host)
-
-	// Logger
-	logger := httplog.NewLogger("httplog-example", httplog.Options{
-		// JSON:             true,
-		LogLevel:       slog.LevelDebug,
-		Concise:        false,
-		RequestHeaders: true,
-		// TimeFieldFormat: time.RFC850,
-		QuietDownRoutes: []string{
-			"/",
-			"/ping",
-		},
-		QuietDownPeriod: 10 * time.Second,
-		// SourceFieldName: "source",
-	})
-
-	r := chi.NewRouter()
-	r.Use(httplog.RequestLogger(logger))
-	r.Use(middleware.Heartbeat("/ping"))
-	r.Use(middleware.Recoverer)
-	r.Use(AddCommonHeaders)
-
-	client, err := grpc.NewClient(net.JoinHostPort(host, port))
-	if err != nil {
-		log.Fatalf("Failed to create client: %s", err)
-	}
-
-	r.Get("/login", GetJWT)
-
-	// Protected routes
-	r.Group(func(r chi.Router) {
-		r.Use(AddAuth)
-		r.Get("/{chainid}/{round}", GetBeacon(client))
-	})
-
-	http.ListenAndServe(":8080", r)
-}
-
-func AddCommonHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Server", version)
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		next.ServeHTTP(w, r)
-	})
-}
-
-func AddAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeader := strings.Split(r.Header.Get("Authorization"), "Bearer ")
-		if len(authHeader) != 2 {
-			log.Println("Received invalid request", authHeader)
-
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
-			return
-		}
-
-		log.Println("Received request", authHeader)
-
-		token, err := jwt.Parse(authHeader[1], func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			return jwtSecret, nil
-		})
-
+	nodesAddr := strings.Split(*grpcURL, ",")
+	for _, nodeAdd := range nodesAddr {
+		_, _, err := net.SplitHostPort(nodeAdd)
 		if err != nil {
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
-			return
+			log.Fatalf("Unable to parse --grpc flag correctly, please provide valid node URLs. On %q, got err: %v", nodeAdd, err)
 		}
+	}
 
-		if !token.Valid {
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-var jwtSecret = []byte("our-secret")
-
-func GetJWT(w http.ResponseWriter, r *http.Request) {
-	// Create a new token object
-	token := jwt.New(jwt.SigningMethodHS256)
-
-	// Create a JWT and send it as response
-	tokenString, err := token.SignedString(jwtSecret)
+	client, err := grpc.NewClient("fallback:///"+*grpcURL, slog.Default())
 	if err != nil {
-		http.Error(w, "Error while signing the token", http.StatusInternalServerError)
+		log.Fatal("Failed to create client", "address", nodesAddr, "error", err)
+	}
+	defer client.Close()
+
+	go serveMetrics()
+
+	slog.Info("Starting http relay", "version", version, "client", client)
+
+	// The HTTP Server
+	server := &http.Server{Addr: *httpBind, Handler: drandHandler(client)}
+
+	// Server run context
+	serverCtx, serverStopCtx := context.WithCancel(context.Background())
+
+	// Listen for syscall signals for process to exit gracefully
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	go func() {
+		defer serverStopCtx()
+		s := <-sig
+
+		slog.Info("Caught interrupt, shutting down...", "signal", s.String())
+
+		// Shutdown signal with grace period of 30 seconds
+		shutdownCtx, _ := context.WithTimeout(serverCtx, 30*time.Second)
+		go func() {
+			<-shutdownCtx.Done()
+			if errors.Is(shutdownCtx.Err(), context.DeadlineExceeded) {
+				slog.Error("graceful shutdown timed out.. forcing exit")
+				return
+			}
+		}()
+
+		// Trigger graceful shutdown
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			slog.Error("server Shutdown error", "err", err)
+			return
+		}
+	}()
+
+	// Run the server
+	err = server.ListenAndServe()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("server error", "err", err)
 		return
 	}
 
-	response := map[string]string{
-		"token": tokenString,
-	}
-
-	fmt.Println("JWT token is:", tokenString)
-	json.NewEncoder(w).Encode(response)
+	// Wait for server context to be stopped
+	<-serverCtx.Done()
+	slog.Info("drand http server stopped")
 }
 
-func GetBeacon(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		roundStr := chi.URLParam(r, "round")
-		_ = chi.URLParam(r, "chainId")
-
-		round, err := strconv.ParseUint(roundStr, 10, 64)
-		if err != nil {
-			http.Error(w, "Failed to parse round. Err: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		// Assuming we have a method in our gRPC client to get a beacon by round
-		beacon, err := c.GetBeacon("", round)
-		if err != nil {
-			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
-			return
-		}
-		json, err := json.Marshal(NewHexBeacon(beacon))
-		if err != nil {
-			http.Error(w, "Failed to Encode beacon in hex", http.StatusInternalServerError)
-			return
-		}
-
-		w.Write(json)
+func getLogLevel() slog.Level {
+	if *verbose {
+		return slog.LevelDebug
 	}
+	return slog.LevelInfo
 }
