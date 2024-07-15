@@ -95,6 +95,7 @@ func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Reques
 		}
 
 		// TODO: should we rather use the api.version key from the request context set in apiVersionCtx?
+		// the current way of doing it probably allows the compiler to inline the right path tho...
 		if isV2 {
 			// we make sure that the V2 api aren't marshaling randommness
 			beacon.UnsetRandomness()
@@ -288,7 +289,7 @@ func GetInfoV2(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 	}
 }
 
-func GetLatest(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
+func GetLatest(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		m, err := createRequestMD(r)
 		if err != nil {
@@ -304,6 +305,16 @@ func GetLatest(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
 				return
 			}
+		}
+
+		// TODO: should we rather use the api.version key from the request context set in apiVersionCtx?
+		// the current way of doing it probably allows the compiler to inline the right path tho...
+		if isV2 {
+			// we make sure that the V2 api aren't marshaling randommness
+			beacon.UnsetRandomness()
+		} else {
+			// we need to set the randomness since the nodes are not supposed to send it over the wire anymore
+			beacon.SetRandomness()
 		}
 
 		json, err := json.Marshal(beacon)
