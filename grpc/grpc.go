@@ -168,6 +168,22 @@ func (c *Client) Watch(ctx context.Context, m *proto.Metadata) <-chan *HexBeacon
 	return ch
 }
 
+// Next is providing you with the next beacon emitted by the network designated in the metadata
+func (c *Client) Next(ctx context.Context, m *proto.Metadata) *HexBeacon {
+	ctx, cancel := context.WithCancel(ctx)
+	ch := c.Watch(ctx, m)
+	select {
+	case <-ctx.Done():
+		cancel()
+	case h, closed := <-ch:
+		cancel()
+		if !closed {
+			return h
+		}
+	}
+	return nil
+}
+
 // Check is relying on GRPC default health reporting service, it does not indicate whether a node is behind or not,
 // only whether a node is currently up or not.
 func (c *Client) Check(ctx context.Context) error {
