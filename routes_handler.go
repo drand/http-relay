@@ -328,6 +328,35 @@ func GetLatest(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Reques
 	}
 }
 
+func GetNext(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		m, err := createRequestMD(r)
+		if err != nil {
+			slog.Error("[GetNext] unable to create metadata for request", "error", err)
+			http.Error(w, "Failed to get latest", http.StatusInternalServerError)
+			return
+		}
+
+		beacon, err := c.Next(r.Context(), m)
+		if err != nil {
+			if err != nil {
+				slog.Error("[GetNext] unable to get next beacon from any grpc client", "error", err)
+				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		json, err := json.Marshal(beacon)
+		if err != nil {
+			slog.Error("[GetNext] unable to encode beacon in json", "error", err)
+			http.Error(w, "Failed to encode beacon", http.StatusInternalServerError)
+			return
+		}
+
+		w.Write(json)
+	}
+}
+
 func createRequestMD(r *http.Request) (*proto.Metadata, error) {
 	chainhash := chi.URLParam(r, "chainhash")
 	beaconID := chi.URLParam(r, "beaconID")

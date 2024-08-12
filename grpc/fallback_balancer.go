@@ -359,7 +359,7 @@ func UsedEndpointInterceptor(l logger) grpc.UnaryClientInterceptor {
 		usedEndpoint := grpc.PeerCallOption{PeerAddr: &peer.Peer{}}
 		opts = append(opts, usedEndpoint)
 		err := invoker(ctx, method, req, reply, cc, opts...)
-		l.Info("", "endpoint", usedEndpoint.PeerAddr.String())
+		l.Debug("Fallback UsedEndpointInterceptor", "method", method, "remote", usedEndpoint.PeerAddr.String())
 		return err
 	}
 }

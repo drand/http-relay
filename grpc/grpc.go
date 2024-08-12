@@ -12,7 +12,6 @@ import (
 
 	proto "github.com/drand/drand/v2/protobuf/drand"
 	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
-	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/timeout"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
@@ -30,7 +29,10 @@ func init() {
 	balancer.Register(NewFallbackBuilder(FallbackTimeout))
 	// registers the logging_pick_first_with_fallback balancer
 	balancer.Register(NewLoggingBalancerBuilder("pick_first_with_fallback", slog.With("service", "balancer")))
-	bindMetrics()
+	err := bindMetrics()
+	if err != nil {
+		slog.Error("Failed to bind metrics during grpc init: ", err)
+	}
 	clock = time.Now
 }
 
@@ -77,7 +79,7 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
 			// TODO: do we really want a 500ms default healthTimeout on unary RPC?
-			timeout.UnaryClientInterceptor(500*time.Millisecond),
+			//timeout.UnaryClientInterceptor(500*time.Millisecond),
 			clMetrics.UnaryClientInterceptor(),
 			UsedEndpointInterceptor(l),
 		),
@@ -168,20 +170,20 @@ func (c *Client) Watch(ctx context.Context, m *proto.Metadata) <-chan *HexBeacon
 	return ch
 }
 
-// Next is providing you with the next beacon emitted by the network designated in the metadata
-func (c *Client) Next(ctx context.Context, m *proto.Metadata) *HexBeacon {
+// Next is providing you with the next beacon emitted by the network designated in the metadata, in a _blocking_ way.
+func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error) {
 	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	ch := c.Watch(ctx, m)
 	select {
 	case <-ctx.Done():
-		cancel()
-	case h, closed := <-ch:
-		cancel()
-		if !closed {
-			return h
+		return nil, ctx.Err()
+	case h, ok := <-ch:
+		if ok {
+			return h, nil
 		}
 	}
-	return nil
+	return nil, fmt.Errorf("closed watch channel. ctx.Err: %w", ctx.Err())
 }
 
 // Check is relying on GRPC default health reporting service, it does not indicate whether a node is behind or not,
