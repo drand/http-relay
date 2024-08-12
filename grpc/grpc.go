@@ -29,8 +29,7 @@ func init() {
 	balancer.Register(NewFallbackBuilder(FallbackTimeout))
 	// registers the logging_pick_first_with_fallback balancer
 	balancer.Register(NewLoggingBalancerBuilder("pick_first_with_fallback", slog.With("service", "balancer")))
-	err := bindMetrics()
-	if err != nil {
+	if err := bindMetrics(); err != nil {
 		slog.Error("Failed to bind metrics during grpc init: ", err)
 	}
 	clock = time.Now
@@ -78,8 +77,6 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first_with_fallback"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
-			// TODO: do we really want a 500ms default healthTimeout on unary RPC?
-			//timeout.UnaryClientInterceptor(500*time.Millisecond),
 			clMetrics.UnaryClientInterceptor(),
 			UsedEndpointInterceptor(l),
 		),
