@@ -101,7 +101,7 @@ func (fb *fallbackBalancer) runBackgroundTimer(timeout time.Duration) {
 			fb.mu.Lock()
 			ticker.Stop()
 			// we empty the balancer
-			for sc, _ := range fb.scAddrs {
+			for sc := range fb.scAddrs {
 				delete(fb.scAddrs, sc)
 			}
 			fb.mu.Unlock()
@@ -359,7 +359,7 @@ func UsedEndpointInterceptor(l logger) grpc.UnaryClientInterceptor {
 		usedEndpoint := grpc.PeerCallOption{PeerAddr: &peer.Peer{}}
 		opts = append(opts, usedEndpoint)
 		err := invoker(ctx, method, req, reply, cc, opts...)
-		l.Info("", "endpoint", usedEndpoint.PeerAddr.String())
+		l.Debug("Fallback UsedEndpointInterceptor", "method", method, "remote", usedEndpoint.PeerAddr.String())
 		return err
 	}
 }

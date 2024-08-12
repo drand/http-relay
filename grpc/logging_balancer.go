@@ -34,10 +34,15 @@ type loggingBalancer struct {
 }
 
 func (b *loggingBalancer) UpdateClientConnState(in balancer.ClientConnState) error {
-	b.log.Info("UpdateClientConnState start", "address_len", len(in.ResolverState.Addresses))
+	b.log.Debug("UpdateClientConnState started", "address_len", len(in.ResolverState.Addresses))
 	err := b.sub.UpdateClientConnState(in)
-	b.log.Info("UpdateClientConnState end", "err", err)
-	return err
+	if err != nil {
+		b.log.Error("UpdateClientConnState errored", "err", err)
+		return err
+	}
+
+	b.log.Debug("UpdateClientConnState done")
+	return nil
 }
 
 func (b *loggingBalancer) ResolverError(err error) {
@@ -46,12 +51,12 @@ func (b *loggingBalancer) ResolverError(err error) {
 }
 
 func (b *loggingBalancer) UpdateSubConnState(cc balancer.SubConn, state balancer.SubConnState) {
-	b.log.Info("UpdateSubConnState", "state", state.ConnectivityState.String())
+	b.log.Debug("UpdateSubConnState", "state", state.ConnectivityState.String())
 	b.sub.UpdateSubConnState(cc, state)
 }
 
 func (b *loggingBalancer) Close() {
-	b.log.Info("Close")
+	b.log.Info("Closing logging balancer", "sub-balancer", b.sub)
 	b.sub.Close()
 }
 
@@ -67,6 +72,10 @@ func (p *logPicker) Pick(i balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{
 		SubConn: result.SubConn,
 		Done: func(info balancer.DoneInfo) {
+			if info.Err == nil && info.BytesSent == info.BytesReceived && !info.BytesSent {
+				p.log.Error("Picker subconn not ready")
+				return
+			}
 			if info.Err != nil {
 				p.log.Error("Picked SubConn errored", "err", info.Err)
 			}
@@ -83,7 +92,7 @@ type wrappedClientConn struct {
 }
 
 func (w *wrappedClientConn) UpdateState(s balancer.State) {
-	w.log.Info("updating state", "state", s, "name", w.name)
+	w.log.Info("Balancer ClientConn state update", "state", s, "name", w.name)
 	w.ClientConn.UpdateState(balancer.State{
 		ConnectivityState: s.ConnectivityState,
 		Picker: &logPicker{

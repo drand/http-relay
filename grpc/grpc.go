@@ -12,7 +12,6 @@ import (
 
 	proto "github.com/drand/drand/v2/protobuf/drand"
 	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
-	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/timeout"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
@@ -30,7 +29,9 @@ func init() {
 	balancer.Register(NewFallbackBuilder(FallbackTimeout))
 	// registers the logging_pick_first_with_fallback balancer
 	balancer.Register(NewLoggingBalancerBuilder("pick_first_with_fallback", slog.With("service", "balancer")))
-	bindMetrics()
+	if err := bindMetrics(); err != nil {
+		slog.Error("Failed to bind metrics during grpc init", "err", err)
+	}
 	clock = time.Now
 }
 
@@ -72,12 +73,10 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	// register client metrics
 	ClientMetrics.Register(clMetrics)
 
-	conn, err := grpc.Dial(serverAddr,
+	conn, err := grpc.NewClient(serverAddr,
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first_with_fallback"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
-			// TODO: do we really want a 500ms default healthTimeout on unary RPC?
-			timeout.UnaryClientInterceptor(500*time.Millisecond),
 			clMetrics.UnaryClientInterceptor(),
 			UsedEndpointInterceptor(l),
 		),
@@ -87,7 +86,7 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
 	if err != nil {
-		l.Error("Unable to Dial", "err", err)
+		l.Error("Unable to dial new grpc client", "err", err)
 	}
 	client := &Client{
 		conn:          conn,
@@ -166,6 +165,22 @@ func (c *Client) Watch(ctx context.Context, m *proto.Metadata) <-chan *HexBeacon
 		}
 	}()
 	return ch
+}
+
+// Next is providing you with the next beacon emitted by the network designated in the metadata, in a _blocking_ way.
+func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := c.Watch(ctx, m)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case h, ok := <-ch:
+		if ok {
+			return h, nil
+		}
+	}
+	return nil, fmt.Errorf("closed watch channel. ctx.Err: %w", ctx.Err())
 }
 
 // Check is relying on GRPC default health reporting service, it does not indicate whether a node is behind or not,

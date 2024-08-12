@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -107,15 +106,4 @@ func addCommonHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		next.ServeHTTP(w, r)
 	})
-}
-
-// apiVersionCtx is meant to do introspection further down in our routes to
-// allow different handling of specific requests depending on the API version
-func apiVersionCtx(version string) func(next http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r = r.WithContext(context.WithValue(r.Context(), "api.version", version))
-			next.ServeHTTP(w, r)
-		})
-	}
 }
