@@ -101,7 +101,7 @@ func (fb *fallbackBalancer) runBackgroundTimer(timeout time.Duration) {
 			fb.mu.Lock()
 			ticker.Stop()
 			// we empty the balancer
-			for sc, _ := range fb.scAddrs {
+			for sc := range fb.scAddrs {
 				delete(fb.scAddrs, sc)
 			}
 			fb.mu.Unlock()

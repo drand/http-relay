@@ -14,7 +14,6 @@ func SetupRoutes(r *chi.Mux, client *grpc.Client) {
 		if *requireAuth {
 			r.Use(AddAuth)
 		}
-		r.Use(apiVersionCtx("v2"))
 		r.Route("/v2", func(r chi.Router) {
 			// use our common headers for the following routes
 			r.Use(addCommonHeaders)
@@ -40,7 +39,6 @@ func SetupRoutes(r *chi.Mux, client *grpc.Client) {
 		// use our common headers for the following routes
 		r.Use(addCommonHeaders)
 
-		r.Use(apiVersionCtx("v1"))
 		r.Get("/chains", GetChains(client))
 
 		r.Get("/info", GetInfoV1(client))

@@ -94,8 +94,6 @@ func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Reques
 			}
 		}
 
-		// TODO: should we rather use the api.version key from the request context set in apiVersionCtx?
-		// the current way of doing it probably allows the compiler to inline the right path tho...
 		if isV2 {
 			// we make sure that the V2 api aren't marshaling randommness
 			beacon.UnsetRandomness()
@@ -339,11 +337,9 @@ func GetNext(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 
 		beacon, err := c.Next(r.Context(), m)
 		if err != nil {
-			if err != nil {
-				slog.Error("[GetNext] unable to get next beacon from any grpc client", "error", err)
-				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
-				return
-			}
+			slog.Error("[GetNext] unable to get next beacon from any grpc client", "error", err)
+			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
+			return
 		}
 
 		json, err := json.Marshal(beacon)

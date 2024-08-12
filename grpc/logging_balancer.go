@@ -72,7 +72,7 @@ func (p *logPicker) Pick(i balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{
 		SubConn: result.SubConn,
 		Done: func(info balancer.DoneInfo) {
-			if info.Err == nil && info.BytesSent == info.BytesReceived && info.BytesSent == false {
+			if info.Err == nil && info.BytesSent == info.BytesReceived && !info.BytesSent {
 				p.log.Error("Picker subconn not ready")
 				return
 			}

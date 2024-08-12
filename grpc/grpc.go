@@ -30,7 +30,7 @@ func init() {
 	// registers the logging_pick_first_with_fallback balancer
 	balancer.Register(NewLoggingBalancerBuilder("pick_first_with_fallback", slog.With("service", "balancer")))
 	if err := bindMetrics(); err != nil {
-		slog.Error("Failed to bind metrics during grpc init: ", err)
+		slog.Error("Failed to bind metrics during grpc init", "err", err)
 	}
 	clock = time.Now
 }
@@ -73,7 +73,7 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	// register client metrics
 	ClientMetrics.Register(clMetrics)
 
-	conn, err := grpc.Dial(serverAddr,
+	conn, err := grpc.NewClient(serverAddr,
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first_with_fallback"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
@@ -86,7 +86,7 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
 	if err != nil {
-		l.Error("Unable to Dial", "err", err)
+		l.Error("Unable to dial new grpc client", "err", err)
 	}
 	client := &Client{
 		conn:          conn,
