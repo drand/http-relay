@@ -18,8 +18,8 @@ func NewLoggingBalancerBuilder(balancerName string, l logger) balancer.Builder {
 }
 
 func (b *loggingBalancerBuilder) Build(cc balancer.ClientConn, opt balancer.BuildOptions) balancer.Balancer {
-	b.log.Info("building logging balancer", "sub-balancer", b.sub, "connTarget", cc.Target(), "BuildOptions Target", opt.Target.String())
-	return &loggingBalancer{sub: balancer.Get(b.sub).Build(&wrappedClientConn{cc, cc.Target(), b.log}, opt), log: b.log}
+	b.log.Info("building logging balancer", "sub-balancer", b.sub, "BuildOptionsTarget", opt.Target.String())
+	return &loggingBalancer{sub: balancer.Get(b.sub).Build(&wrappedClientConn{cc, opt.Target.String(), b.log}, opt), log: b.log}
 }
 
 // Name will return the name of the underlying balancer used during registration with NewLoggingBalancerBuilder,
@@ -68,7 +68,7 @@ type logPicker struct {
 func (p *logPicker) Pick(i balancer.PickInfo) (balancer.PickResult, error) {
 	result, err := p.sub.Pick(i)
 
-	p.log.Debug("Pick", "endpoint", result.SubConn, "rpc", i.FullMethodName, "md", result.Metadata, "err", err)
+	p.log.Debug("Pick", "endpoint", result.SubConn, "rpc", i.FullMethodName, "md", result.Metadata, "picker", p.sub, "err", err)
 	return balancer.PickResult{
 		SubConn: result.SubConn,
 		Done: func(info balancer.DoneInfo) {
