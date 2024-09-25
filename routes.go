@@ -109,7 +109,7 @@ func SetupRoutes(r *chi.Mux, client *grpc.Client) {
 	})
 
 	// we want to populate all the routes served by our Chi router to display them in DisplayRoutes
-	allRoutes = make([]string, 0, 20)
+	allRoutes = make([]string, 0, 22)
 	// need to populate the all routes slice to display all existing routes
 	walkFunc := func(method string, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error {
 		// we don't show the special error route for max uint64
