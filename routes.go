@@ -54,6 +54,8 @@ func DisplayRoutes(w http.ResponseWriter, r *http.Request) {
 		return strings.Compare(a, b)
 	})
 
+	// We still report it as a 404
+	w.WriteHeader(http.StatusNotFound)
 	w.Write([]byte(strings.Join(filteredRoutes, "\n")))
 }
 
