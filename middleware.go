@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -52,6 +51,8 @@ func drandHandler(client *grpc.Client) http.Handler {
 		QuietDownPeriod: 1 * time.Second,
 	})
 
+	logger.Info("logger instantiated", "LogLevel", getLogLevel())
+
 	// this also setups Request ID and Panic Recoverer middleware behind the hood
 	r.Use(httplog.RequestLogger(logger))
 
@@ -65,23 +66,6 @@ func drandHandler(client *grpc.Client) http.Handler {
 	}
 
 	SetupRoutes(r, client)
-
-	// we want to print all routes served by our chi router
-	allRoutes := make([]string, 0, 20)
-	// displays all existing routes in the CLI upon starting or calling /
-	walkFunc := func(method string, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error {
-		// we don't show the special error route for max uint64
-		if strings.Contains(route, "18446744073709551615") {
-			return nil
-		}
-		route = strings.Replace(route, "/*/", "/", -1)
-		allRoutes = append(allRoutes, fmt.Sprintf("%s %s", method, route))
-		return nil
-	}
-	if err := chi.Walk(r, walkFunc); err != nil {
-		fmt.Printf("Logging err: %s\n", err.Error())
-	}
-	r.Get("/", DisplayRoutes(allRoutes))
 
 	// we explicitly don't serve favicon
 	r.Get("/favicon.ico", http.NotFound)

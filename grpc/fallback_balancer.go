@@ -207,7 +207,7 @@ type scWithAddr struct {
 func (s *scWithAddr) String() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return fmt.Sprintf("%d/%d-%s", s.priority, s.order, s.addr)
+	return fmt.Sprintf("%d(%d)-%s", s.priority, s.order, s.addr)
 }
 
 func (s *scWithAddr) ResetPriority() {

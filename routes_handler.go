@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,25 +19,6 @@ import (
 )
 
 var FrontrunTiming time.Duration
-
-func DisplayRoutes(allRoutes []string) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
-		slices.SortFunc(allRoutes, func(a, b string) int {
-			// cmp(a, b) should return a negative number when a < b, a positive number when
-			// a > b and zero when a == b.
-			if strings.HasPrefix(a, "GET /v2") && !strings.HasPrefix(b, "GET /v2") {
-				return 1
-			} else if strings.HasPrefix(b, "GET /v2") && !strings.HasPrefix(a, "GET /v2") {
-				return -1
-			}
-			return strings.Compare(a, b)
-		})
-		w.Write([]byte(strings.Join(allRoutes, "\n")))
-	}
-}
 
 func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
