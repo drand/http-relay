@@ -34,7 +34,7 @@ func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Reques
 			slog.Error("Failed get beacon", "error", err, "nextTime", nextTime)
 
 			if nextTime < 0 {
-				w.Header().Set("Cache-Control", fmt.Sprintf("must-revalidate, no-cache, max-age=%d", -nextTime))
+				w.Header().Set("Cache-Control", fmt.Sprintf("must-revalidate, public, max-age=%d", -nextTime))
 
 				// I know, 425 is meant to indicate a replay attack risk, but hey, it's the perfect error name!
 				http.Error(w, "Requested future beacon", http.StatusTooEarly)
