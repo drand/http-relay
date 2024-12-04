@@ -26,7 +26,6 @@ var (
 	requireAuth = flag.Bool("enable-auth", false, "Forces JWT authentication on V2 API using the JWT secret from the AUTH_TOKEN env variable.")
 	verbose     = flag.Bool("verbose", false, "Prints as many logs as possible.")
 	jsonFlag    = flag.Bool("json", false, "Prints logs in JSON format.")
-	frontrun    = flag.Int64("frontrun", 0, "When waiting for the next round, start the query this amount of ms earlier to counteract network latency.")
 	_           = flag.Bool("insecure", false, "deprecated flag")
 	_           = flag.String("hash-list", "", "deprecated flag")
 )
@@ -34,9 +33,6 @@ var (
 func init() {
 	flag.Parse()
 	slog.SetLogLoggerLevel(getLogLevel())
-	if *frontrun > 0 {
-		FrontrunTiming = time.Duration(*frontrun) * time.Millisecond
-	}
 }
 
 func main() {

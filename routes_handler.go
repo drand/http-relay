@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/drand/drand/v2/common"
@@ -18,93 +17,159 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-var FrontrunTiming time.Duration
-
 func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		m, err := createRequestMD(r)
-		if err != nil {
-			slog.Error("unable to create metadata for request", "error", err)
-			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
-			return
-		}
-
 		roundStr := chi.URLParam(r, "round")
 		round, err := strconv.ParseUint(roundStr, 10, 64)
 		if err != nil {
 			w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+
+			slog.Error("unable to parse round", "error", err)
 			http.Error(w, "Failed to parse round. Err: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		info, err := c.GetChainInfo(r.Context(), m)
+		beacon, nextTime, err := getBeacon(c, r, round)
 		if err != nil {
-			slog.Error("[GetBeacon] error retrieving chain info from primary client", "error", err)
-			// we will skip cache-age setting, something is wrong
-			w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
-			if errors.Is(err, context.Canceled) {
-				http.Error(w, "timeout", http.StatusGatewayTimeout)
-			} else if strings.Contains(err.Error(), "unknown chain hash") {
-				http.Error(w, "unknown chain hash", http.StatusBadRequest)
+			slog.Error("Failed get beacon", "error", err, "nextTime", nextTime)
+
+			if nextTime < 0 {
+				w.Header().Set("Cache-Control", fmt.Sprintf("must-revalidate, no-cache, max-age=%d", -nextTime))
+
+				// I know, 425 is meant to indicate a replay attack risk, but hey, it's the perfect error name!
+				http.Error(w, "Requested future beacon", http.StatusTooEarly)
 			} else {
-				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
-			}
-			return
-		}
-
-		nextTime, nextRound := info.ExpectedNext()
-		if round >= nextRound+1 { // never happens when fetching latest because round == 0
-			w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
-			slog.Error("[GetBeacon] Future beacon was requested, unexpected", "requested", round, "expected", nextRound, "from", r.RemoteAddr)
-			// I know, 425 is meant to indicate a replay attack risk, but hey, it's the perfect error name!
-			http.Error(w, "Requested future beacon", http.StatusTooEarly)
-			return
-		} else if round == nextRound {
-			// we wait until the round is supposed to be emitted, minus frontrun to account for network latency anyway
-			time.Sleep(time.Duration(nextTime-time.Now().Unix())*time.Second - FrontrunTiming)
-		}
-
-		beacon, err := c.GetBeacon(r.Context(), m, round)
-		if err != nil {
-			if err != nil {
-				slog.Error("all clients are unable to provide beacons", "error", err)
 				w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+
 				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
-				return
 			}
-		}
-
-		if isV2 {
-			// we make sure that the V2 api aren't marshaling randommness
-			beacon.UnsetRandomness()
-		} else {
-			// we need to set the randomness since the nodes are not supposed to send it over the wire anymore
-			beacon.SetRandomness()
-		}
-
-		json, err := json.Marshal(beacon)
-		if err != nil {
-			w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
-			http.Error(w, "Failed to Encode beacon in hex", http.StatusInternalServerError)
 			return
 		}
 
+		writeBeacon(w, beacon, nextTime, isV2)
+	}
+}
+
+func getBeacon(c *grpc.Client, r *http.Request, round uint64) (*grpc.HexBeacon, int64, error) {
+	m, err := createRequestMD(r)
+	if err != nil {
+		return nil, 0, fmt.Errorf("createRequestMD error: %w", err)
+	}
+
+	info, err := c.GetChainInfo(r.Context(), m)
+	if err != nil {
+		return nil, 0, fmt.Errorf("GetChainInfo error: %w", err)
+	}
+
+	nextTime, nextRound := info.ExpectedNext()
+	// we refuse rounds too far in the future
+	if round >= nextRound+1 {
+		slog.Error("[GetBeacon] Future beacon was requested, unexpected", "requested", round, "expected", nextRound, "from", r.RemoteAddr)
+		// TODO: we could have a more precise nextTime value instead of just period
+		// we return the negative time to cache this response
+		return nil, -int64(info.Period), fmt.Errorf("future beacon was requested")
+	}
+
+	var beacon *grpc.HexBeacon
+	// if we are requesting the next round
+	if round == nextRound {
+		beacon, err = c.Next(r.Context(), m)
+		if err != nil {
+			slog.Error("[GetBeacon] unable to get next beacon from any grpc client", "error", err)
+			return nil, 0, fmt.Errorf("Next error: %w", err)
+
+		}
+		// we use -1 to indicate no caching
+		nextTime = -1
+	} else {
+		beacon, err = c.GetBeacon(r.Context(), m, round)
+		if err != nil {
+			slog.Error("all clients are unable to provide beacons", "error", err)
+			return nil, 0, fmt.Errorf("GetBeacon error: %w", err)
+		}
+		// if this was a query for a set round, we cache it forever anyway
 		if round != 0 {
-			// i.e. we're not fetching latest, we can store these beacons for a long time
-			w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
-		} else {
-			cacheTime := nextTime - time.Now().Unix()
-			if cacheTime < 0 {
-				cacheTime = 0
-			}
-			// we're fetching latest we need to stop caching in time for the next round
-			w.Header().Set("Cache-Control",
-				fmt.Sprintf("public, must-revalidate, max-age=%d", cacheTime))
-			slog.Debug("[GetBeacon] StatusOK", "cachetime", cacheTime)
+			nextTime = 0
+		}
+	}
+	return beacon, nextTime, nil
+}
+
+func writeBeacon(w http.ResponseWriter, beacon *grpc.HexBeacon, nextTime int64, isV2 bool) {
+	// TODO: should we rather use the api.version key from the request context set in apiVersionCtx?
+	// the current way of doing it probably allows the compiler to inline the right path tho...
+	if isV2 {
+		// we make sure that the V2 api aren't marshaling randommness
+		beacon.UnsetRandomness()
+	} else {
+		// we need to set the randomness since the nodes are not supposed to send it over the wire anymore
+		beacon.SetRandomness()
+	}
+
+	json, err := json.Marshal(beacon)
+	if err != nil {
+		w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+
+		slog.Error("unable to encode beacon in json", "error", err)
+		http.Error(w, "Failed to encode beacon", http.StatusInternalServerError)
+		return
+	}
+
+	if nextTime == 0 {
+		// i.e. we're not fetching latest or next, we can store these beacons for a long time
+		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+	} else if nextTime < 0 {
+		// we must never cache the next beacon, since we wait for them
+		w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+	} else {
+		// for latest we compute the right time
+		cacheTime := nextTime - time.Now().Unix()
+		if cacheTime < 0 {
+			cacheTime = 0
+		}
+		// we're fetching latest we need to stop caching in time for the next round
+		w.Header().Set("Cache-Control",
+			fmt.Sprintf("public, must-revalidate, max-age=%d", cacheTime))
+		slog.Debug("[GetBeacon] StatusOK", "cachetime", cacheTime)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write(json)
+}
+
+func GetLatest(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		beacon, nextTime, err := getBeacon(c, r, 0)
+		if err != nil {
+			w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+
+			slog.Error("Failed get beacon", "error", err, "nextTime", nextTime)
+			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
+			return
 		}
 
-		w.WriteHeader(http.StatusOK)
-		w.Write(json)
+		writeBeacon(w, beacon, nextTime, isV2)
+	}
+}
+
+func GetNext(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		m, err := createRequestMD(r)
+		if err != nil {
+			slog.Error("[GetNext] unable to create metadata for request", "error", err)
+			http.Error(w, "Failed to get latest", http.StatusInternalServerError)
+			return
+		}
+
+		beacon, err := c.Next(r.Context(), m)
+		if err != nil {
+			slog.Error("[GetNext] unable to get next beacon from any grpc client", "error", err)
+			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
+			return
+		}
+		// GetNext is only available as a V2 endpoint
+		// -1 because no caching
+		writeBeacon(w, beacon, -1, isV2)
 	}
 }
 
@@ -260,72 +325,6 @@ func GetInfoV2(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 		if err != nil {
 			slog.Error("[GetInfoV2] unable to encode ChainInfo in json", "error", err)
 			http.Error(w, "Failed to encode ChainInfo", http.StatusInternalServerError)
-			return
-		}
-
-		w.Write(json)
-	}
-}
-
-func GetLatest(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		m, err := createRequestMD(r)
-		if err != nil {
-			slog.Error("[GetLatest] unable to create metadata for request", "error", err)
-			http.Error(w, "Failed to get latest", http.StatusInternalServerError)
-			return
-		}
-
-		beacon, err := c.GetBeacon(r.Context(), m, 0)
-		if err != nil {
-			if err != nil {
-				slog.Error("[GetLatest] unable to get beacon from any grpc client", "error", err)
-				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
-				return
-			}
-		}
-
-		// TODO: should we rather use the api.version key from the request context set in apiVersionCtx?
-		// the current way of doing it probably allows the compiler to inline the right path tho...
-		if isV2 {
-			// we make sure that the V2 api aren't marshaling randommness
-			beacon.UnsetRandomness()
-		} else {
-			// we need to set the randomness since the nodes are not supposed to send it over the wire anymore
-			beacon.SetRandomness()
-		}
-
-		json, err := json.Marshal(beacon)
-		if err != nil {
-			slog.Error("[GetLatest] unable to encode beacon in json", "error", err)
-			http.Error(w, "Failed to encode beacon", http.StatusInternalServerError)
-			return
-		}
-
-		w.Write(json)
-	}
-}
-
-func GetNext(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		m, err := createRequestMD(r)
-		if err != nil {
-			slog.Error("[GetNext] unable to create metadata for request", "error", err)
-			http.Error(w, "Failed to get latest", http.StatusInternalServerError)
-			return
-		}
-
-		beacon, err := c.Next(r.Context(), m)
-		if err != nil {
-			slog.Error("[GetNext] unable to get next beacon from any grpc client", "error", err)
-			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
-			return
-		}
-
-		json, err := json.Marshal(beacon)
-		if err != nil {
-			slog.Error("[GetNext] unable to encode beacon in json", "error", err)
-			http.Error(w, "Failed to encode beacon", http.StatusInternalServerError)
 			return
 		}
 
