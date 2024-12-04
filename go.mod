@@ -1,8 +1,6 @@
 module github.com/drand/http-server
 
-go 1.22.7
-
-toolchain go1.23.2
+go 1.22.10
 
 require (
 	github.com/drand/drand/v2 v2.0.4
