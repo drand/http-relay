@@ -39,7 +39,7 @@ func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Reques
 				// I know, 425 is meant to indicate a replay attack risk, but hey, it's the perfect error name!
 				http.Error(w, "Requested future beacon", http.StatusTooEarly)
 			} else {
-				w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+				w.Header().Set("Cache-Control", "no-cache")
 
 				http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
 			}
@@ -50,6 +50,9 @@ func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Reques
 	}
 }
 
+// getBeacon return the HexBeacon, the time of the next round, and/or an error.
+// A negative nextTime value is only used in case of an error, to indicate how
+// long that error should be cached.
 func getBeacon(c *grpc.Client, r *http.Request, round uint64) (*grpc.HexBeacon, int64, error) {
 	m, err := createRequestMD(r)
 	if err != nil {
@@ -108,7 +111,7 @@ func writeBeacon(w http.ResponseWriter, beacon *grpc.HexBeacon, nextTime int64, 
 
 	json, err := json.Marshal(beacon)
 	if err != nil {
-		w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+		w.Header().Set("Cache-Control", "no-cache")
 
 		slog.Error("unable to encode beacon in json", "error", err)
 		http.Error(w, "Failed to encode beacon", http.StatusInternalServerError)
@@ -120,7 +123,7 @@ func writeBeacon(w http.ResponseWriter, beacon *grpc.HexBeacon, nextTime int64, 
 		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 	} else if nextTime < 0 {
 		// we must never cache the next beacon, since we wait for them
-		w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+		w.Header().Set("Cache-Control", "no-cache")
 	} else {
 		// for latest we compute the right time
 		cacheTime := nextTime - time.Now().Unix()
@@ -141,7 +144,7 @@ func GetLatest(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Reques
 	return func(w http.ResponseWriter, r *http.Request) {
 		beacon, nextTime, err := getBeacon(c, r, 0)
 		if err != nil {
-			w.Header().Set("Cache-Control", "must-revalidate, no-cache, max-age=0")
+			w.Header().Set("Cache-Control", "no-cache")
 
 			slog.Error("Failed get beacon", "error", err, "nextTime", nextTime)
 			http.Error(w, "Failed to get beacon", http.StatusInternalServerError)
