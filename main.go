@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/drand/http-server/grpc"
+	"github.com/drand/http-relay/grpc"
 )
 
 var (

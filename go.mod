@@ -1,4 +1,4 @@
-module github.com/drand/http-server
+module github.com/drand/http-relay
 
 go 1.22.10
 

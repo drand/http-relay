@@ -13,7 +13,7 @@ import (
 
 	"github.com/drand/drand/v2/common"
 	proto "github.com/drand/drand/v2/protobuf/drand"
-	"github.com/drand/http-server/grpc"
+	"github.com/drand/http-relay/grpc"
 	"github.com/go-chi/chi/v5"
 )
 

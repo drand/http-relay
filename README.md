@@ -1,23 +1,30 @@
 ## drand HTTP relay
 
-This repo is a complete rewrite of the HTTP relays that could initially be found in drand/drand and later in drand/drand-cli to be a self-sufficient binary that connects to a (set of) drand node(s) and queries them in the provided order in case of errors. (i.e. the latter ones in the list are fallbacks in case the first one is down.)
+This repo is a complete rewrite of the HTTP relays that could initially be found in drand/drand repo to be a self-sufficient binary that connects to a (set of) drand node(s) and queries them in the provided order in case of errors (i.e. the latter ones in the list are fallbacks in case the first one is down.)
 
 This is also conveniently implemented using Chi and Chi middleware, allowing us to easily provide local caching, authentication, rate-limiting based on authentication, and other features in the future as needed.
 
-This is a minimal dependency project, meant to run without CGO but also with CGO.
+# How to use the HTTP relays
 
-# Benchmarks
+Ideally a drand v2 node should only talk gRPC.
+Therefore, this repo replaces the `--public-listen` flag from `drand` to allow to serve drand beacons over HTTP.
 
-When requests are done on time:
+The relay connect to a drand node (or multiple) using gRPC, and then proceed to query beacons from these nodes to serve them
+over HTTP. The relay are also in charge of properly setting the Cache-Control headers for beacons, to allow for optimal caching and 
+CDN usage for serving beacons.
 
-When requests are done 20ms before the round is supposed to be emitted:
+Typically usage, assuming you have a drand node running as:
+```
+drand start --folder /tmp/drand-full/node --control 33383 --private-listen 0.0.0.0:39107 --public-listen 0.0.0.0:35097 --verbose
+```
 
-When requests are done 20ms after the round is supposed to be emitted:
+You can replace the `--public-listen 0.0.0.0:35097` flag with this relay by running:
+``` 
+make
+./drand-relay-http --grpc-connect "127.0.0.1:35097" --bind 0.0.0.0:35097 --verbose --metrics 127.0.0.1:9992
+```
 
-When requests are done 700ms after the round is supposed to be emitted:
-
-When requests are done 800ms after the round is supposed to be emitted:
-
+the `--verbose` and `--metrics` flags are optional, especially the `--verbose` one since it exposes DEBUG level gRPC logs. 
 
 ---
 
