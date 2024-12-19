@@ -9,6 +9,7 @@ import (
 	"github.com/drand/http-relay/grpc"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/go-chi/httplog/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -58,6 +59,9 @@ func drandHandler(client *grpc.Client) http.Handler {
 
 	// setup the ping endpoint for load balancers and uptime testing, without ACLs
 	r.Use(middleware.Heartbeat("/ping"))
+
+	// Basic CORS
+	r.Use(cors.AllowAll().Handler)
 
 	if *verbose {
 		// when running in verbose mode, we have a special Debug log telling us for each request whether it was matched
