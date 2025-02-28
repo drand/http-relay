@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	version     = "drand-http-server-v2.2.0"
+	version     = "drand-http-server-v2.2.1"
 	metricFlag  = flag.String("metrics", "localhost:9999", "The flag to set the interface for metrics. Defaults to localhost:9999")
 	httpBind    = flag.String("bind", "localhost:8080", "The address to bind the http server to")
 	grpcURL     = flag.String("grpc-connect", "localhost:4444", "The URL and port to your drand node's grpc port, e.g. pl1-rpc.testnet.drand.sh:443 you can add fallback nodes by separating them with a comma: pl1-rpc.testnet.drand.sh:443,pl2-rpc.testnet.drand.sh:443")
