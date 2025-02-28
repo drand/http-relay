@@ -84,6 +84,14 @@ func getBeacon(c *grpc.Client, r *http.Request, round uint64) (*grpc.HexBeacon, 
 		}
 		// we use -1 to indicate no caching
 		nextTime = -1
+		if beacon.GetRound() != round {
+			beacon, err = c.GetBeacon(r.Context(), m, round)
+			if err != nil {
+				slog.Error("all clients are unable to provide beacons", "error", err)
+				return nil, 0, fmt.Errorf("GetBeacon error: %w", err)
+			}
+			nextTime = 0
+		}
 	} else {
 		beacon, err = c.GetBeacon(r.Context(), m, round)
 		if err != nil {
