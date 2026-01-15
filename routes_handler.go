@@ -17,15 +17,35 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+// readRound parses and validates the round parameter from the HTTP request.
+func readRound(r *http.Request) (uint64, error) {
+	roundStr := chi.URLParam(r, "round")
+	if roundStr == "" {
+		return 0, fmt.Errorf("round parameter is required")
+	}
+
+	roundN, err := strconv.ParseUint(roundStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid round number %q: %w", roundStr, err)
+	}
+
+	// Set a reasonable maximum to prevent issues with time calculations
+	const maxReasonableRound = uint64(1 << 60)
+	if roundN > maxReasonableRound {
+		return 0, fmt.Errorf("round number %d exceeds maximum allowed value %d", roundN, maxReasonableRound)
+	}
+
+	return roundN, nil
+}
+
 func GetBeacon(c *grpc.Client, isV2 bool) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		roundStr := chi.URLParam(r, "round")
-		round, err := strconv.ParseUint(roundStr, 10, 64)
+		round, err := readRound(r)
 		if err != nil {
 			w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 
-			slog.Error("unable to parse round", "error", err)
-			http.Error(w, "Failed to parse round. Err: "+err.Error(), http.StatusBadRequest)
+			slog.Error("unable to parse round", "error", err, "client", r.RemoteAddr, "path", r.URL.Path)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 

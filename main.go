@@ -31,6 +31,14 @@ var (
 )
 
 func init() {
+	// Skip flag parsing during tests
+	if len(os.Args) > 0 {
+		for _, arg := range os.Args {
+			if arg == "-test.v" || arg == "-test.run" || strings.HasPrefix(arg, "-test.") {
+				return
+			}
+		}
+	}
 	flag.Parse()
 	slog.SetLogLoggerLevel(getLogLevel())
 }
