@@ -71,3 +71,39 @@ func TestAddAuth_RejectsHS512(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+func TestAddAuth_MissingHeader(t *testing.T) {
+	secretHex := strings.Repeat("c", 256)
+	t.Setenv("DRAND_AUTH_KEY", secretHex)
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	protected := AddAuth(next)
+
+	r := httptest.NewRequest(http.MethodGet, "/v2/chains", nil)
+	w := httptest.NewRecorder()
+
+	protected.ServeHTTP(w, r)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	require.Equal(t, "Missing JWT\n", w.Body.String())
+}
+
+func TestAddAuth_InvalidToken(t *testing.T) {
+	secretHex := strings.Repeat("d", 256)
+	t.Setenv("DRAND_AUTH_KEY", secretHex)
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	protected := AddAuth(next)
+
+	r := httptest.NewRequest(http.MethodGet, "/v2/chains", nil)
+	r.Header.Set("Authorization", "Bearer not-a-valid-jwt")
+	w := httptest.NewRecorder()
+
+	protected.ServeHTTP(w, r)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	require.Equal(t, "Invalid JWT\n", w.Body.String())
+}
+
+
