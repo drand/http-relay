@@ -60,6 +60,11 @@ func (b *loggingBalancer) Close() {
 	b.sub.Close()
 }
 
+func (b *loggingBalancer) ExitIdle() {
+	b.log.Debug("ExitIdle")
+	b.sub.ExitIdle()
+}
+
 type logPicker struct {
 	sub balancer.Picker
 	log logger
