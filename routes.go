@@ -57,7 +57,9 @@ func DisplayRoutes(w http.ResponseWriter, r *http.Request) {
 
 	// We still report it as a 404
 	w.WriteHeader(http.StatusNotFound)
-	w.Write([]byte(strings.Join(filteredRoutes, "\n")))
+	if _, err := w.Write([]byte(strings.Join(filteredRoutes, "\n"))); err != nil {
+		slog.Error("failed to write routes response", "error", err)
+	}
 }
 
 func SetupRoutes(r *chi.Mux, client *grpc.Client) {
