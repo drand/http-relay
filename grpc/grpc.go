@@ -251,6 +251,21 @@ func (info *JsonInfoV2) ExpectedNext() (expectedTime int64, expectedRound uint64
 	return current*p + info.GenesisTime, uint64(current) + 1
 }
 
+// SecondsUntilRound returns the number of seconds from now until the given round becomes available.
+// Round N happens at GenesisTime + (N-1)*Period. Used for cache duration when returning "future beacon" errors.
+func (info *JsonInfoV2) SecondsUntilRound(round uint64) int64 {
+	if round == 0 {
+		return 0
+	}
+	p := int64(info.Period)
+	roundTime := info.GenesisTime + int64(round-1)*p
+	secs := roundTime - clock().Unix()
+	if secs < 0 {
+		return 0
+	}
+	return secs
+}
+
 func (j *JsonInfoV2) V1() *JsonInfoV1 {
 	return &JsonInfoV1{
 		PublicKey:   j.PublicKey,

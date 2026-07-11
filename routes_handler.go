@@ -68,9 +68,9 @@ func getBeacon(c *grpc.Client, r *http.Request, round uint64) (*grpc.HexBeacon, 
 	// we refuse rounds too far in the future
 	if round >= nextRound+1 {
 		slog.Error("[GetBeacon] Future beacon was requested, unexpected", "requested", round, "expected", nextRound, "from", r.RemoteAddr)
-		// TODO: we could have a more precise nextTime value instead of just period
-		// we return the negative time to cache this response
-		return nil, -int64(info.Period), fmt.Errorf("future beacon was requested")
+		// Use precise time until next round for cache duration instead of full period
+		preciseCacheSeconds := info.SecondsUntilRound(nextRound)
+		return nil, -preciseCacheSeconds, fmt.Errorf("future beacon was requested")
 	}
 
 	var beacon *grpc.HexBeacon
