@@ -222,24 +222,38 @@ type JsonInfoV1 struct {
 
 // JsonInfoV2 is the V2 representation of the chain info, which contains breaking changes compared to V1.
 type JsonInfoV2 struct {
-	PublicKey   HexBytes `json:"public_key"`
-	Period      uint32   `json:"period"`
-	GenesisTime int64    `json:"genesis_time"`
-	GenesisSeed HexBytes `json:"genesis_seed,omitempty"`
-	Hash        HexBytes `json:"chain_hash"`
-	Scheme      string   `json:"scheme"`
-	BeaconId    string   `json:"beacon_id"`
+	PublicKey            HexBytes `json:"public_key"`
+	Period               uint32   `json:"period"`
+	GenesisTime          int64    `json:"genesis_time"`
+	GenesisSeed          HexBytes `json:"genesis_seed,omitempty"`
+	Hash                 HexBytes `json:"chain_hash"`
+	Scheme               string   `json:"scheme"`
+	BeaconId             string   `json:"beacon_id"`
+	CatchupPeriodSeconds uint32   `json:"catchup_period_seconds,omitempty"`
+}
+
+// getCatchupPeriodSeconds safely extracts the catchup_period_seconds field from ChainInfoPacket.
+// It uses protoreflect to access the field dynamically, returning 0 if the field doesn't exist.
+func getCatchupPeriodSeconds(resp *proto.ChainInfoPacket) uint32 {
+	msg := resp.ProtoReflect()
+	desc := msg.Descriptor()
+	field := desc.Fields().ByName("catchup_period_seconds")
+	if field != nil && msg.Has(field) {
+		return uint32(msg.Get(field).Uint())
+	}
+	return 0
 }
 
 func NewInfoV2(resp *proto.ChainInfoPacket) *JsonInfoV2 {
 	return &JsonInfoV2{
-		PublicKey:   resp.GetPublicKey(),
-		BeaconId:    resp.GetMetadata().GetBeaconID(),
-		Period:      resp.GetPeriod(),
-		Scheme:      resp.GetSchemeID(),
-		GenesisTime: resp.GetGenesisTime(),
-		GenesisSeed: resp.GetGroupHash(),
-		Hash:        resp.GetMetadata().GetChainHash(),
+		PublicKey:            resp.GetPublicKey(),
+		BeaconId:             resp.GetMetadata().GetBeaconID(),
+		Period:               resp.GetPeriod(),
+		Scheme:               resp.GetSchemeID(),
+		GenesisTime:          resp.GetGenesisTime(),
+		GenesisSeed:          resp.GetGroupHash(),
+		Hash:                 resp.GetMetadata().GetChainHash(),
+		CatchupPeriodSeconds: getCatchupPeriodSeconds(resp),
 	}
 }
 
@@ -265,13 +279,14 @@ func (j *JsonInfoV2) V1() *JsonInfoV1 {
 
 func (j *JsonInfoV1) V2() *JsonInfoV2 {
 	return &JsonInfoV2{
-		PublicKey:   j.PublicKey,
-		Period:      j.Period,
-		GenesisTime: j.GenesisTime,
-		Hash:        j.Hash,
-		GenesisSeed: j.GroupHash,
-		BeaconId:    j.Metadata.GetBeaconID(),
-		Scheme:      j.SchemeID,
+		PublicKey:            j.PublicKey,
+		Period:               j.Period,
+		GenesisTime:          j.GenesisTime,
+		Hash:                 j.Hash,
+		GenesisSeed:          j.GroupHash,
+		BeaconId:             j.Metadata.GetBeaconID(),
+		Scheme:               j.SchemeID,
+		CatchupPeriodSeconds: 0, // V1 doesn't have this field
 	}
 }
 
