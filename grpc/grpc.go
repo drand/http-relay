@@ -87,6 +87,7 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	)
 	if err != nil {
 		l.Error("Unable to dial new grpc client", "err", err)
+		return nil, fmt.Errorf("unable to create grpc client for %s: %w", serverAddr, err)
 	}
 	client := &Client{
 		conn:          conn,
@@ -196,7 +197,7 @@ func (c *Client) Check(ctx context.Context) error {
 	resp, err := client.Check(tctx, &healthgrpc.HealthCheckRequest{})
 	if err != nil {
 		// we do 1 retry (automagically with the next subconn thanks to the fallback LB) if it failed
-		resp, err = client.Check(ctx, &healthgrpc.HealthCheckRequest{})
+		resp, err = client.Check(tctx, &healthgrpc.HealthCheckRequest{})
 		if err != nil {
 			return err
 		}
