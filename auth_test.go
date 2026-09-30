@@ -70,4 +70,3 @@ func TestAddAuth_RejectsHS512(t *testing.T) {
 	protected.ServeHTTP(w, r)
 	require.Equal(t, http.StatusUnauthorized, w.Code)
 }
-

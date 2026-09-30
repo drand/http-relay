@@ -52,7 +52,7 @@ func (b *loggingBalancer) ResolverError(err error) {
 
 func (b *loggingBalancer) UpdateSubConnState(cc balancer.SubConn, state balancer.SubConnState) {
 	b.log.Debug("UpdateSubConnState", "state", state.ConnectivityState.String())
-	b.sub.UpdateSubConnState(cc, state)
+	b.sub.UpdateSubConnState(cc, state) //nolint:staticcheck // forwarding the deprecated method to the wrapped balancer
 }
 
 func (b *loggingBalancer) Close() {
@@ -122,14 +122,14 @@ func (w *wrappedClientConn) NewSubConn(addrs []resolver.Address, opts balancer.N
 	addr := addrs[0]
 	w.log.Debug("NewSubConn called", "addrs", len(addrs), "first", addr.Addr)
 	nOpts := balancer.NewSubConnOptions{
-		CredsBundle:        opts.CredsBundle,
+		CredsBundle:        opts.CredsBundle, //nolint:staticcheck // copied through unchanged
 		HealthCheckEnabled: opts.HealthCheckEnabled,
 		StateListener: func(state balancer.SubConnState) {
 			w.log.Debug("StateListener", "addr", addr.Addr, "state", state.ConnectivityState.String())
 			opts.StateListener(state)
 		},
 	}
-	sb, err := w.ClientConn.NewSubConn([]resolver.Address{addr}, nOpts)
+	sb, err := w.ClientConn.NewSubConn([]resolver.Address{addr}, nOpts) //nolint:staticcheck // single address, as the deprecation requires
 	if err != nil {
 		w.log.Error("NewSubConn errored", "err", err)
 	}
