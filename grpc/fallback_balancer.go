@@ -184,7 +184,7 @@ func (fb *fallbackBalancer) UpdateClientConnState(s balancer.ClientConnState) er
 		fbLog.Warning("resolver provided zero addresses")
 		// TODO: is this true?
 		// it's important to shutdown all SubConn above since ResolverError relies on len(ReadySC) to re-resolve
-		fb.Balancer.ResolverError(fmt.Errorf("resolver provided zero addresses"))
+		fb.ResolverError(fmt.Errorf("resolver provided zero addresses"))
 		return balancer.ErrBadResolverState
 	}
 

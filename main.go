@@ -57,7 +57,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to create client", "address", nodesAddr, "error", err)
 	}
-	defer client.Close()
+	defer client.Close() //nolint:errcheck // process is exiting
 
 	go serveMetrics()
 

@@ -1,0 +1,18 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        # A failed write means the client went away; handlers cannot recover.
+        - (net/http.ResponseWriter).Write
+  exclusions:
+    rules:
+      # Tests cover the legacy randomness field that drand still serves.
+      - path: grpc/beacon_test\.go
+        linters: [staticcheck]
+        text: "SA1019: .*Randomness is deprecated"
+
+formatters:
+  enable:
+    - gofmt

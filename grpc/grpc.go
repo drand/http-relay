@@ -70,8 +70,9 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		),
 	)
 
-	// register client metrics
-	ClientMetrics.Register(clMetrics)
+	if err := ClientMetrics.Register(clMetrics); err != nil {
+		l.Error("failed to register grpc client metrics", "err", err)
+	}
 
 	conn, err := grpc.NewClient(serverAddr,
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first_with_fallback"}`),
