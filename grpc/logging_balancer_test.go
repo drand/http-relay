@@ -136,9 +136,7 @@ func TestLogPicker_Pick_NoPanicOnError(t *testing.T) {
 	// Accessing result fields should be safe (they should be zero-valued)
 	_ = result.SubConn
 	_ = result.Metadata
-	if result.Done != nil {
-		// If Done is nil, that's fine - we guard it in the code
-	}
+	_ = result.Done
 }
 
 func TestLogPicker_Pick_DoneCallback(t *testing.T) {

@@ -119,7 +119,7 @@ func SetupRoutes(r *chi.Mux, client *grpc.Client) {
 		if strings.Contains(route, "18446744073709551615") {
 			return nil
 		}
-		route = strings.Replace(route, "/*/", "/", -1)
+		route = strings.ReplaceAll(route, "/*/", "/")
 		allRoutes = append(allRoutes, fmt.Sprintf("%s %s", method, route))
 		return nil
 	}
