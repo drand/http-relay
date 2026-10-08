@@ -354,7 +354,14 @@ func createRequestMD(r *http.Request) (*proto.Metadata, error) {
 
 	// handling the beacon ID case
 	if beaconID != "" && chainhash == "" {
-		return &proto.Metadata{BeaconID: beaconID}, nil
+		// clients sometimes hit /beacons/ with a chain hash; beacon IDs are never 64 hex chars
+		if len(beaconID) != 64 {
+			return &proto.Metadata{BeaconID: beaconID}, nil
+		}
+		if _, err := hex.DecodeString(beaconID); err != nil {
+			return &proto.Metadata{BeaconID: beaconID}, nil
+		}
+		chainhash = beaconID
 	}
 
 	// handling the chain hash case
