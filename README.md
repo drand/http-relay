@@ -37,3 +37,11 @@ Therefore, the project is dual-licensed under Apache 2.0 and MIT terms:
 - Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or https://opensource.org/licenses/MIT)
 89 
+
+### Benchmarks
+
+`bench_test.go` runs the relay against an in-process fake drand node (`internal/fakenode`) that emits one round per second. The `GetNext`, `GetBeaconNextRound` and `ClientNext` benchmarks report how long after a round is emitted the waiting clients receive it (`p50-ms`, `p90-ms`, `p99-ms`, `max-ms`). Each iteration waits for a real round, so use a fixed iteration count:
+
+```sh
+make bench
+```
