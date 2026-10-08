@@ -64,7 +64,7 @@ func main() {
 	slog.Info("Starting http relay", "version", version, "client", client)
 
 	// The HTTP Server
-	server := &http.Server{Addr: *httpBind, Handler: drandHandler(client)}
+	server := &http.Server{Addr: *httpBind, Handler: drandHandler(client, os.Stdout)}
 
 	// Server run context
 	serverCtx, serverStopCtx := context.WithCancel(context.Background())
