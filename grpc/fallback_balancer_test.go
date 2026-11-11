@@ -190,3 +190,25 @@ func TestPenaltyKeepsLongerDeadline(t *testing.T) {
 		t.Errorf("Pick after the short penalties ended = %s, want b", got)
 	}
 }
+
+func TestLateReadyNodeBeforePenalized(t *testing.T) {
+	fb := newTestBalancer("a", "b")
+	p := &picker{fb: fb}
+	stream := context.WithValue(context.Background(), streamPenaltyKey{}, time.Hour)
+	unavailable := status.Error(codes.Unavailable, "node down")
+	for i, want := range []string{"a", "b", "c"} {
+		if want == "c" {
+			// c becomes READY with an order equal to a's penalized priority
+			sc := &fakeSubConn{}
+			fb.scAddrs[sc] = &scWithAddr{sc: sc, addr: "c", priority: 2, order: 2}
+		}
+		res, err := p.Pick(balancer.PickInfo{Ctx: stream})
+		if err != nil {
+			t.Fatalf("Pick %d: %v", i, err)
+		}
+		if got := res.Metadata["target"][0]; got != want {
+			t.Fatalf("Pick %d = %s, want %s", i, got, want)
+		}
+		res.Done(balancer.DoneInfo{Err: unavailable})
+	}
+}

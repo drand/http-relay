@@ -1,6 +1,7 @@
 package grpc
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -267,9 +268,16 @@ func scCmp(s, t *scWithAddr) int {
 	} else if t == nil {
 		return -1
 	}
+	sp, su, so := s.rank()
+	tp, tu, to := t.rank()
+	// on equal priorities, a penalized SubConn goes behind one that became READY since
+	return cmp.Or(cmp.Compare(sp, tp), su.Compare(tu), cmp.Compare(so, to))
+}
+
+func (s *scWithAddr) rank() (priority int, penalizedUntil time.Time, order int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.priority - t.priority
+	return s.priority, s.penalizedUntil, s.order
 }
 
 // insert will insert s in scs in a sorted way, relying on the above comparison function. It will be in ascending order.
