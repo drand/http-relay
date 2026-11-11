@@ -116,8 +116,8 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration) error {
 	c.nextMu.Lock()
 	wait := time.Until(s.retryAt)
-	// The picker keeps choosing the node that just failed us, skipping it on every other attempt moves the stream
-	// to the next node without pinning it there.
+	// The picker keeps choosing the node that just failed us. Skipping on every other attempt alternates the stream
+	// between the two preferred ready nodes; a third node is never reached.
 	skip := s.failures%2 == 1
 	c.nextMu.Unlock()
 	if wait > 0 {
