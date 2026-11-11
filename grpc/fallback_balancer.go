@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -13,10 +14,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/base"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/serviceconfig"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -118,15 +121,20 @@ func (fb *fallbackBalancer) Close() {
 	close(fb.closing)
 }
 
-func (fb *fallbackBalancer) dec(sc balancer.SubConn) {
+// deprioritize moves sc behind every other SubConn until the next priority reset.
+func (fb *fallbackBalancer) deprioritize(sc balancer.SubConn) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
-	if sca, ok := fb.scAddrs[sc]; !ok {
+	sca, ok := fb.scAddrs[sc]
+	if !ok {
 		fbLog.Error("trying to update state on a non-existent subconn", "subconn", sc)
-	} else {
-		// -2 to increase the chance of having another higher priority conn available
-		sca.UpdatePriority(-2)
+		return
 	}
+	last := sca.Priority()
+	for _, other := range fb.scAddrs {
+		last = max(last, other.Priority())
+	}
+	sca.SetPriority(last + 1)
 }
 
 // first returns the subconn with the highest priority among the ones available.
@@ -216,10 +224,16 @@ func (s *scWithAddr) ResetPriority() {
 	s.priority = s.order
 }
 
-func (s *scWithAddr) UpdatePriority(update int) {
+func (s *scWithAddr) Priority() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.priority
+}
+
+func (s *scWithAddr) SetPriority(priority int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.priority += update
+	s.priority = priority
 }
 
 // scCmp should return 0 if the slice element s matches
@@ -328,7 +342,7 @@ func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 		second := p.fb.second()
 		if second != nil {
 			fbLog.Error("skipping & deprioritizing first SubConn for now", "addr", picked.addr)
-			p.fb.dec(picked.sc)
+			p.fb.deprioritize(picked.sc)
 			picked = second
 		}
 	}
@@ -345,12 +359,28 @@ func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{
 		SubConn: picked.sc,
 		Done: func(info balancer.DoneInfo) {
-			if info.Err != nil {
-				p.fb.dec(picked.sc)
+			if nodeFault(b.Ctx, info.Err) {
+				p.fb.deprioritize(picked.sc)
 			}
 		},
 		Metadata: metadata.MD{"target": []string{picked.addr}},
 	}, nil
+}
+
+// nodeFault reports whether err means the node failed the call, rather than the caller giving up or asking for
+// something no node can serve. A stream we cancelled because the node stopped emitting beacons is the node's fault.
+func nodeFault(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return errors.Is(context.Cause(ctx), errStreamStalled)
+	}
+	switch status.Code(err) {
+	case codes.Canceled, codes.InvalidArgument, codes.NotFound, codes.OutOfRange, codes.FailedPrecondition:
+		return false
+	}
+	return true
 }
 
 // UsedEndpointInterceptor is a gRPC client-side interceptor that provides reporting for which endpoint is being used by each RPC.

@@ -33,12 +33,6 @@ type fakeStream struct {
 	recv chan recvResult
 }
 
-// skipped reports whether the stream asked the picker to skip the preferred node.
-func (s *fakeStream) skipped() bool {
-	skip, _ := s.ctx.Value(SkipCtxKey{}).(bool)
-	return skip
-}
-
 func (s *fakeStream) Recv() (*proto.PublicRandResponse, error) {
 	select {
 	case <-s.ctx.Done():
@@ -265,20 +259,15 @@ func TestNextStalledStream(t *testing.T) {
 			t.Fatalf("opened %d streams before the stall timeout, want 1", got)
 		}
 
-		// each stall reopens the stream, alternating between skipping the preferred node and not
-		wantSkips := []bool{false, true, false}
+		// each stall reopens the stream
+		const wantStreams = 3
 		time.Sleep(time.Nanosecond + c.minBackoff)
 		synctest.Wait()
 		time.Sleep(stall + 2*c.minBackoff)
 		synctest.Wait()
 		streams := node.opened()
-		if len(streams) != len(wantSkips) {
-			t.Fatalf("opened %d streams after two stalls, want %d", len(streams), len(wantSkips))
-		}
-		for i, want := range wantSkips {
-			if got := streams[i].skipped(); got != want {
-				t.Errorf("stream %d skipped the preferred node = %t, want %t", i, got, want)
-			}
+		if len(streams) != wantStreams {
+			t.Fatalf("opened %d streams after two stalls, want %d", len(streams), wantStreams)
 		}
 
 		streams[2].recv <- recvResult{resp: &proto.PublicRandResponse{Round: 43}}
@@ -291,8 +280,8 @@ func TestNextStalledStream(t *testing.T) {
 		synctest.Wait()
 		time.Sleep(c.maxBackoff)
 		synctest.Wait()
-		if got := len(node.opened()); got != len(wantSkips) {
-			t.Errorf("opened %d streams after a stall without waiters, want %d", got, len(wantSkips))
+		if got := len(node.opened()); got != wantStreams {
+			t.Errorf("opened %d streams after a stall without waiters, want %d", got, wantStreams)
 		}
 		c.nextMu.Lock()
 		for key, s := range c.streams {
