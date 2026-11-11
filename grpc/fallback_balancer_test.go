@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/balancer"
@@ -82,34 +83,47 @@ func newTestBalancer(addrs ...string) *fallbackBalancer {
 
 func TestPickerFailover(t *testing.T) {
 	ctx := context.Background()
-	stalled, stall := context.WithCancelCause(ctx)
+	stream := context.WithValue(ctx, streamPenaltyKey{}, time.Minute)
+	stalled, stall := context.WithCancelCause(stream)
 	stall(errStreamStalled)
-	cancelled, cancel := context.WithCancel(ctx)
+	cancelled, cancel := context.WithCancel(stream)
 	cancel()
 	skip := context.WithValue(ctx, SkipCtxKey{}, true)
 	unavailable := status.Error(codes.Unavailable, "node down")
+	// drand nodes return plain errors, which reach the client as codes.Unknown
+	unknownRound := status.Error(codes.Unknown, "can't retrieve beacon 7")
 
 	type pick struct {
-		ctx  context.Context
-		err  error // reported to Done
-		want string
+		reset bool // run a priority reset before the pick
+		ctx   context.Context
+		err   error // reported to Done
+		want  string
 	}
 	tests := []struct {
 		name  string
 		picks []pick
 	}{
-		{"node error moves to the next node", []pick{{ctx, unavailable, "a"}, {ctx, nil, "b"}}},
-		{"stall moves to the next node", []pick{{stalled, status.Error(codes.Canceled, "stalled"), "a"}, {ctx, nil, "b"}}},
-		{"caller cancel keeps the node", []pick{{cancelled, status.Error(codes.Canceled, "gone"), "a"}, {ctx, nil, "a"}}},
-		{"unknown round keeps the node", []pick{{ctx, status.Error(codes.NotFound, "no round"), "a"}, {ctx, nil, "a"}}},
-		{"skip moves to the next node", []pick{{skip, nil, "b"}, {ctx, nil, "b"}}},
-		{"repeated errors reach the third node", []pick{{ctx, unavailable, "a"}, {ctx, unavailable, "b"}, {ctx, nil, "c"}}},
-		{"success keeps the node", []pick{{ctx, nil, "a"}, {ctx, nil, "a"}}},
+		{"node error moves to the next node", []pick{{false, ctx, unavailable, "a"}, {false, ctx, nil, "b"}}},
+		{"stream error moves to the next node", []pick{{false, stream, unknownRound, "a"}, {false, ctx, nil, "b"}}},
+		{"stall moves to the next node", []pick{{false, stalled, status.Error(codes.Canceled, "stalled"), "a"}, {false, ctx, nil, "b"}}},
+		{"caller cancel keeps the node", []pick{{false, cancelled, status.Error(codes.Canceled, "gone"), "a"}, {false, ctx, nil, "a"}}},
+		{"unknown round keeps the node", []pick{{false, ctx, unknownRound, "a"}, {false, ctx, nil, "a"}}},
+		{"skip moves to the next node", []pick{{false, skip, nil, "b"}, {false, ctx, nil, "b"}}},
+		{"repeated errors reach the third node", []pick{{false, ctx, unavailable, "a"}, {false, ctx, unavailable, "b"}, {false, ctx, nil, "c"}}},
+		{"stream errors reach the third node across resets", []pick{
+			{false, stream, unknownRound, "a"}, {true, stream, unknownRound, "b"}, {true, stream, nil, "c"},
+		}},
+		{"expired penalty ends at the reset", []pick{{false, ctx, unavailable, "a"}, {true, ctx, nil, "a"}}},
+		{"success keeps the node", []pick{{false, ctx, nil, "a"}, {false, ctx, nil, "a"}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p := &picker{fb: newTestBalancer("a", "b", "c")}
+			fb := newTestBalancer("a", "b", "c")
+			p := &picker{fb: fb}
 			for i, pk := range tt.picks {
+				if pk.reset {
+					fb.resetPriorities(time.Now())
+				}
 				res, err := p.Pick(balancer.PickInfo{Ctx: pk.ctx})
 				if err != nil {
 					t.Fatalf("Pick %d: %v", i, err)

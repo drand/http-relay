@@ -1,0 +1,153 @@
+package grpc
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	proto "github.com/drand/drand/v2/protobuf/drand"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
+)
+
+// recordingBuilder builds fallback balancers under its own name and hands each one to built.
+type recordingBuilder struct {
+	balancer.Builder
+	built chan *fallbackBalancer
+}
+
+func (recordingBuilder) Name() string { return "recording_" + fallbackName }
+
+func (b recordingBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
+	fb := b.Builder.Build(cc, opts).(*fallbackBalancer)
+	b.built <- fb
+	return fb
+}
+
+var (
+	registerRecording sync.Once
+	builtBalancers    = make(chan *fallbackBalancer, 1)
+)
+
+// streamNode is a drand node whose PublicRandStream fails with fail, or sends one beacon when fail is nil.
+type streamNode struct {
+	proto.UnimplementedPublicServer
+	fail    func(proto.Public_PublicRandStreamServer) error
+	streams atomic.Int32
+}
+
+func (n *streamNode) PublicRandStream(_ *proto.PublicRandRequest, stream proto.Public_PublicRandStreamServer) error {
+	n.streams.Add(1)
+	if n.fail != nil {
+		return n.fail(stream)
+	}
+	if err := stream.Send(&proto.PublicRandResponse{Round: 42}); err != nil {
+		return err
+	}
+	<-stream.Context().Done()
+	return nil
+}
+
+func TestStreamReopensOnNextNode(t *testing.T) {
+	registerRecording.Do(func() {
+		balancer.Register(recordingBuilder{NewFallbackBuilder(FallbackTimeout), builtBalancers})
+	})
+
+	tests := []struct {
+		name string
+		fail func(proto.Public_PublicRandStreamServer) error
+	}{
+		{"stall", func(stream proto.Public_PublicRandStreamServer) error {
+			<-stream.Context().Done()
+			return nil
+		}},
+		{"error", func(proto.Public_PublicRandStreamServer) error {
+			return errors.New("beacon has not started on this node yet")
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			failing, healthy := &streamNode{fail: tt.fail}, &streamNode{}
+			listeners := map[string]*bufconn.Listener{}
+			for addr, node := range map[string]*streamNode{"a": failing, "b": healthy} {
+				lis := bufconn.Listen(1 << 16)
+				srv := grpc.NewServer()
+				proto.RegisterPublicServer(srv, node)
+				go func() { _ = srv.Serve(lis) }()
+				t.Cleanup(srv.Stop)
+				listeners[addr] = lis
+			}
+
+			conn, err := grpc.NewClient("fallback:///a,b",
+				grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"recording_`+fallbackName+`"}`),
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+					return listeners[addr].DialContext(ctx)
+				}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+			conn.Connect()
+			fb := <-builtBalancers
+			waitReady(t, fb, 2)
+
+			c := newClient(proto.NewPublicClient(conn), slog.New(slog.DiscardHandler))
+			c.minBackoff, c.maxBackoff = time.Millisecond, 10*time.Millisecond
+			ch := make(chan nextResult, 1)
+			s := &sharedStream{waiters: map[chan nextResult]struct{}{ch: {}}}
+			const stall = 50 * time.Millisecond
+
+			if err := c.receive(s, &proto.Metadata{}, stall); err == nil {
+				t.Fatal("receive on the failing node returned no error")
+			}
+			done := make(chan error, 1)
+			go func() { done <- c.receive(s, &proto.Metadata{}, stall) }()
+			select {
+			case res := <-ch:
+				if res.err != nil || res.beacon.Round != 42 {
+					t.Errorf("reopened stream got %+v, want round 42", res)
+				}
+			case err := <-done:
+				t.Fatalf("reopened stream failed: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("reopened stream got no beacon")
+			}
+			c.cancel()
+			if err := <-done; err == nil {
+				t.Error("receive returned no error after the client closed")
+			}
+
+			if got, want := failing.streams.Load(), int32(1); got != want {
+				t.Errorf("failing node got %d streams, want %d", got, want)
+			}
+			if got, want := healthy.streams.Load(), int32(1); got != want {
+				t.Errorf("healthy node got %d streams, want %d", got, want)
+			}
+		})
+	}
+}
+
+// waitReady waits until fb has n ready SubConns.
+func waitReady(t *testing.T, fb *fallbackBalancer, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		fb.mu.RLock()
+		ready := len(fb.scAddrs)
+		fb.mu.RUnlock()
+		if ready == n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("balancer has fewer than %d ready SubConns", n)
+}

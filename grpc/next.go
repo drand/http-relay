@@ -115,8 +115,6 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 
 func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration) error {
 	c.nextMu.Lock()
-	// The picker deprioritized the node that failed this stream, so a reopen lands on the next one. That lasts until
-	// the picker's next priority reset (FallbackTimeout), so a longer backoff can return to the failed node.
 	wait := time.Until(s.retryAt)
 	c.nextMu.Unlock()
 	if wait > 0 {
@@ -129,6 +127,9 @@ func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration
 
 	ctx, cancel := context.WithCancelCause(c.ctx)
 	defer cancel(nil)
+	// The picker keeps a node that failed this stream behind the others until the next node had time to stall too,
+	// so consecutive reopens go through every node.
+	ctx = context.WithValue(ctx, streamPenaltyKey{}, stall+2*c.maxBackoff)
 	// a node can keep the connection up without emitting beacons
 	var watchdog *time.Timer
 	if stall > 0 {

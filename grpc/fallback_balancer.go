@@ -63,7 +63,11 @@ func (fallbackBB) Name() string {
 }
 
 func (f fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Balancer {
-	b := &fallbackBalancer{scAddrs: make(map[balancer.SubConn]*scWithAddr), closing: make(chan struct{})}
+	b := &fallbackBalancer{
+		scAddrs: make(map[balancer.SubConn]*scWithAddr),
+		closing: make(chan struct{}),
+		timeout: f.timeout,
+	}
 	// we delegate the actual SubConn management to the base balancer
 	baseBuilder := base.NewBalancerBuilder(fallbackName, b,
 		base.Config{
@@ -83,6 +87,8 @@ type fallbackBalancer struct {
 
 	scAddrs map[balancer.SubConn]*scWithAddr // Hold onto SubConn address to keep track for subsequent picker updates.
 	closing chan struct{}
+	// timeout is the reset period, and how long a failing node stays behind the others by default.
+	timeout time.Duration
 }
 
 // Function to continuously process updates
@@ -90,14 +96,8 @@ func (fb *fallbackBalancer) runBackgroundTimer(timeout time.Duration) {
 	ticker := time.NewTimer(timeout)
 	for {
 		select {
-		case <-ticker.C:
-			fb.mu.Lock()
-			// every tick, we reset the priority of all subconn, the ones whose underlying SubConn is actually not READY
-			// are deleted from that list anyway in UpdateClientConnState.
-			for _, sc := range fb.scAddrs {
-				sc.ResetPriority()
-			}
-			fb.mu.Unlock()
+		case now := <-ticker.C:
+			fb.resetPriorities(now)
 			ticker.Reset(timeout)
 		case <-fb.closing:
 			fbLog.Info("received a Close, shutting down fallback balancer")
@@ -121,8 +121,18 @@ func (fb *fallbackBalancer) Close() {
 	close(fb.closing)
 }
 
-// deprioritize moves sc behind every other SubConn until the next priority reset.
-func (fb *fallbackBalancer) deprioritize(sc balancer.SubConn) {
+// resetPriorities restores the configured order of every SubConn whose penalty ended before now. The ones whose
+// underlying SubConn is not READY are deleted from scAddrs anyway in Build.
+func (fb *fallbackBalancer) resetPriorities(now time.Time) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	for _, sc := range fb.scAddrs {
+		sc.ResetPriority(now)
+	}
+}
+
+// deprioritize moves sc behind every other SubConn, and keeps it there for at least d.
+func (fb *fallbackBalancer) deprioritize(sc balancer.SubConn, d time.Duration) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	sca, ok := fb.scAddrs[sc]
@@ -134,7 +144,7 @@ func (fb *fallbackBalancer) deprioritize(sc balancer.SubConn) {
 	for _, other := range fb.scAddrs {
 		last = max(last, other.Priority())
 	}
-	sca.SetPriority(last + 1)
+	sca.Penalize(last+1, time.Now().Add(d))
 }
 
 // first returns the subconn with the highest priority among the ones available.
@@ -207,6 +217,8 @@ type scWithAddr struct {
 	priority int
 	// order is used to prioritize the SubConn to use, a negative one leads to it not being used at all
 	order int
+	// penalizedUntil keeps a failing SubConn's priority through the resets before it.
+	penalizedUntil time.Time
 
 	// we can have concurrent updates of the priority, so we need to guard our scWithAddr with a mutex
 	mu sync.RWMutex
@@ -218,9 +230,12 @@ func (s *scWithAddr) String() string {
 	return fmt.Sprintf("%d(%d)-%s", s.priority, s.order, s.addr)
 }
 
-func (s *scWithAddr) ResetPriority() {
+func (s *scWithAddr) ResetPriority(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if now.Before(s.penalizedUntil) {
+		return
+	}
 	s.priority = s.order
 }
 
@@ -230,10 +245,11 @@ func (s *scWithAddr) Priority() int {
 	return s.priority
 }
 
-func (s *scWithAddr) SetPriority(priority int) {
+func (s *scWithAddr) Penalize(priority int, until time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.priority = priority
+	s.penalizedUntil = until
 }
 
 // scCmp should return 0 if the slice element s matches
@@ -292,6 +308,10 @@ func (fb *fallbackBalancer) Build(info base.PickerBuildInfo) balancer.Picker {
 			continue
 		}
 
+		if old, ok := fb.scAddrs[sc]; ok && old.addr == addr.Address.Addr && old.order == order {
+			// keep its penalty, another SubConn changing state says nothing about this one
+			continue
+		}
 		sca := &scWithAddr{
 			sc:       sc,
 			addr:     addr.Address.Addr,
@@ -331,9 +351,17 @@ func (p *picker) String() string {
 
 type SkipCtxKey struct{}
 
+// streamPenaltyKey marks a call whose every failure is the node's fault. Its time.Duration value is how long the
+// node stays behind the others, which must outlast the time the caller takes to retry.
+type streamPenaltyKey struct{}
+
 func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 	// we rely on the 0 value of int being 0 when the key isn't set
 	skip, _ := b.Ctx.Value(SkipCtxKey{}).(bool)
+	penalty, stream := b.Ctx.Value(streamPenaltyKey{}).(time.Duration)
+	if !stream {
+		penalty = p.fb.timeout
+	}
 
 	picked := p.fb.first()
 	fbLog.Info("considering to pick", "first", picked, "skip", skip)
@@ -342,7 +370,7 @@ func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 		second := p.fb.second()
 		if second != nil {
 			fbLog.Error("skipping & deprioritizing first SubConn for now", "addr", picked.addr)
-			p.fb.deprioritize(picked.sc)
+			p.fb.deprioritize(picked.sc, p.fb.timeout)
 			picked = second
 		}
 	}
@@ -359,8 +387,8 @@ func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{
 		SubConn: picked.sc,
 		Done: func(info balancer.DoneInfo) {
-			if nodeFault(b.Ctx, info.Err) {
-				p.fb.deprioritize(picked.sc)
+			if nodeFault(b.Ctx, info.Err, stream) {
+				p.fb.deprioritize(picked.sc, penalty)
 			}
 		},
 		Metadata: metadata.MD{"target": []string{picked.addr}},
@@ -369,18 +397,23 @@ func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
 
 // nodeFault reports whether err means the node failed the call, rather than the caller giving up or asking for
 // something no node can serve. A stream we cancelled because the node stopped emitting beacons is the node's fault.
-func nodeFault(ctx context.Context, err error) bool {
+// drand nodes report unknown chains and rounds as codes.Unknown, so outside of a stream only transport-level codes
+// count.
+func nodeFault(ctx context.Context, err error, stream bool) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return errors.Is(context.Cause(ctx), errStreamStalled)
 	}
-	switch status.Code(err) {
-	case codes.Canceled, codes.InvalidArgument, codes.NotFound, codes.OutOfRange, codes.FailedPrecondition:
-		return false
+	if stream {
+		return true
 	}
-	return true
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Internal, codes.ResourceExhausted, codes.Unimplemented:
+		return true
+	}
+	return false
 }
 
 // UsedEndpointInterceptor is a gRPC client-side interceptor that provides reporting for which endpoint is being used by each RPC.
