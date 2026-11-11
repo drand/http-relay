@@ -52,6 +52,28 @@ type Client struct {
 	knownChains   sync.Map
 	healthTimeout time.Duration
 	log           logger
+
+	// ctx bounds the shared streams used by Next, Close cancels it.
+	ctx    context.Context
+	cancel context.CancelFunc
+	nextMu sync.Mutex
+	// streams is keyed by hex-encoded chain hash
+	streams                map[string]*sharedStream
+	minBackoff, maxBackoff time.Duration
+}
+
+func newClient(pc proto.PublicClient, l logger) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Client{
+		pc:            pc,
+		healthTimeout: time.Second,
+		log:           l,
+		ctx:           ctx,
+		cancel:        cancel,
+		streams:       make(map[string]*sharedStream),
+		minBackoff:    defaultMinBackoff,
+		maxBackoff:    defaultMaxBackoff,
+	}
 }
 
 // NewClient establishes a new non-TLS grpc connection to the provided server address. It takes a logger and uses
@@ -89,13 +111,9 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	if err != nil {
 		l.Error("Unable to dial new grpc client", "err", err)
 	}
-	client := &Client{
-		conn:          conn,
-		pc:            proto.NewPublicClient(conn),
-		serverAddr:    serverAddr,
-		healthTimeout: time.Second,
-		log:           l,
-	}
+	client := newClient(proto.NewPublicClient(conn), l)
+	client.conn = conn
+	client.serverAddr = serverAddr
 
 	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms healthTimeout built-in above
 	_, err = client.GetChains(context.Background())
@@ -112,6 +130,7 @@ func (c *Client) SetTimeout(timeout time.Duration) {
 func (c *Client) Close() error {
 	c.log.Debug("Client Closing")
 
+	c.cancel()
 	return c.conn.Close()
 }
 
@@ -138,7 +157,8 @@ func (c *Client) GetBeacon(ctx context.Context, m *proto.Metadata, round uint64)
 	return NewHexBeacon(randResp), nil
 }
 
-// Watch returns new randomness as it becomes available.
+// Watch returns new randomness as it becomes available. Each call opens its own stream and the node only keeps the
+// latest stream per peer address, so concurrent calls for the same chain break each other: prefer Next.
 func (c *Client) Watch(ctx context.Context, m *proto.Metadata) <-chan *HexBeacon {
 	c.log.Debug("Client Watch")
 	stream, err := c.pc.PublicRandStream(ctx, &proto.PublicRandRequest{Round: 0, Metadata: m})
@@ -166,22 +186,6 @@ func (c *Client) Watch(ctx context.Context, m *proto.Metadata) <-chan *HexBeacon
 		}
 	}()
 	return ch
-}
-
-// Next is providing you with the next beacon emitted by the network designated in the metadata, in a _blocking_ way.
-func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	ch := c.Watch(ctx, m)
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case h, ok := <-ch:
-		if ok {
-			return h, nil
-		}
-	}
-	return nil, fmt.Errorf("closed watch channel. ctx.Err: %w", ctx.Err())
 }
 
 // Check is relying on GRPC default health reporting service, it does not indicate whether a node is behind or not,
