@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,8 @@ type Client struct {
 	// streams is keyed by hex-encoded chain hash
 	streams                map[string]*sharedStream
 	minBackoff, maxBackoff time.Duration
+	// nodes is how many nodes serve the connection, the Next stream tries each of them before failing its callers.
+	nodes int
 }
 
 func newClient(pc proto.PublicClient, l logger) *Client {
@@ -73,6 +76,7 @@ func newClient(pc proto.PublicClient, l logger) *Client {
 		streams:       make(map[string]*sharedStream),
 		minBackoff:    defaultMinBackoff,
 		maxBackoff:    defaultMaxBackoff,
+		nodes:         1,
 	}
 }
 
@@ -114,6 +118,8 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	client := newClient(proto.NewPublicClient(conn), l)
 	client.conn = conn
 	client.serverAddr = serverAddr
+	// the fallback resolver splits its target on commas
+	client.nodes = strings.Count(serverAddr, ",") + 1
 
 	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms healthTimeout built-in above
 	_, err = client.GetChains(context.Background())

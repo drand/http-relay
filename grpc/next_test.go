@@ -293,6 +293,34 @@ func TestNextStalledStream(t *testing.T) {
 	})
 }
 
+func TestNextStreamErrorTriesEveryNode(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		node := &fakeNode{}
+		c := newClient(node, slog.New(slog.DiscardHandler))
+		defer c.cancel()
+		c.nodes = 3
+		errStream := errors.New("beacon has not started on this node yet")
+
+		results, _ := callNext(c, []*proto.Metadata{byBeaconID})
+		for n := range c.nodes {
+			synctest.Wait()
+			select {
+			case res := <-results[0]:
+				t.Fatalf("Next() after %d stream errors = %v, %v, want it to keep waiting", n, res.beacon, res.err)
+			default:
+			}
+			node.opened()[n].recv <- recvResult{err: errStream}
+			time.Sleep(c.maxBackoff)
+		}
+		if res := <-results[0]; !errors.Is(res.err, errStream) {
+			t.Errorf("Next() after an error on every node = %v, %v, want error %v", res.beacon, res.err, errStream)
+		}
+		if got, want := len(node.opened()), c.nodes; got != want {
+			t.Errorf("opened %d streams, want %d", got, want)
+		}
+	})
+}
+
 func TestNextUnknownChain(t *testing.T) {
 	c := newClient(&fakeNode{}, slog.New(slog.DiscardHandler))
 	defer c.cancel()

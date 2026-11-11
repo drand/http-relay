@@ -249,7 +249,10 @@ func (s *scWithAddr) Penalize(priority int, until time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.priority = priority
-	s.penalizedUntil = until
+	// a short penalty must not end a longer one early
+	if until.After(s.penalizedUntil) {
+		s.penalizedUntil = until
+	}
 }
 
 // scCmp should return 0 if the slice element s matches

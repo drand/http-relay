@@ -101,30 +101,26 @@ func TestStreamReopensOnNextNode(t *testing.T) {
 			waitReady(t, fb, 2)
 
 			c := newClient(proto.NewPublicClient(conn), slog.New(slog.DiscardHandler))
-			c.minBackoff, c.maxBackoff = time.Millisecond, 10*time.Millisecond
+			c.minBackoff, c.maxBackoff, c.nodes = time.Millisecond, 10*time.Millisecond, 2
 			ch := make(chan nextResult, 1)
-			s := &sharedStream{waiters: map[chan nextResult]struct{}{ch: {}}}
+			s := &sharedStream{waiters: map[chan nextResult]struct{}{ch: {}}, running: true}
 			const stall = 50 * time.Millisecond
 
-			if err := c.receive(s, &proto.Metadata{}, stall); err == nil {
-				t.Fatal("receive on the failing node returned no error")
-			}
-			done := make(chan error, 1)
-			go func() { done <- c.receive(s, &proto.Metadata{}, stall) }()
+			done := make(chan struct{})
+			go func() {
+				c.runStream(s, &proto.Metadata{}, stall)
+				close(done)
+			}()
 			select {
 			case res := <-ch:
 				if res.err != nil || res.beacon.Round != 42 {
-					t.Errorf("reopened stream got %+v, want round 42", res)
+					t.Errorf("stream got %v, %v, want round 42", res.beacon, res.err)
 				}
-			case err := <-done:
-				t.Fatalf("reopened stream failed: %v", err)
 			case <-time.After(5 * time.Second):
-				t.Fatal("reopened stream got no beacon")
+				t.Fatal("stream got no beacon")
 			}
 			c.cancel()
-			if err := <-done; err == nil {
-				t.Error("receive returned no error after the client closed")
-			}
+			<-done
 
 			if got, want := failing.streams.Load(), int32(1); got != want {
 				t.Errorf("failing node got %d streams, want %d", got, want)

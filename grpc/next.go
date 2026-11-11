@@ -38,8 +38,8 @@ type sharedStream struct {
 }
 
 // Next blocks until the network designated in the metadata emits its next beacon. Concurrent callers for the same
-// chain share one upstream stream, which stays open until it fails, stalls with no caller waiting or the Client is
-// closed. A late beacon does not fail the callers: they wait until it arrives or their context ends.
+// chain share one upstream stream, which stays open until it failed on every node, stalls with no caller waiting or
+// the Client is closed. A late beacon does not fail the callers: they wait until it arrives or their context ends.
 func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error) {
 	// A beacon ID and a chain hash can designate the same chain, the canonical hash keeps them on one stream.
 	// It also means unknown chains fail here, before they can create any state.
@@ -84,10 +84,11 @@ func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error
 	}
 }
 
-// runStream serves the waiters of s until the stream fails or the Client is closed, then fails the remaining
-// waiters. A stalled stream is reopened as long as it has waiters, which keep waiting. The next call to Next starts
-// it again.
+// runStream serves the waiters of s until the stream failed on every node or the Client is closed, then fails the
+// remaining waiters. A stalled stream is reopened as long as it has waiters, which keep waiting. The next call to
+// Next starts it again.
 func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Duration) {
+	errs := 0 // errors other than stalls since the last beacon
 	for {
 		err := c.receive(s, m, stall)
 		if c.ctx.Err() != nil {
@@ -99,7 +100,15 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 		c.nextMu.Lock()
 		s.failures++
 		s.retryAt = time.Now().Add(c.backoff(s.failures))
-		if errors.Is(err, errStreamStalled) && len(s.waiters) > 0 {
+		if s.failures == 1 {
+			// a beacon arrived since the previous failure
+			errs = 0
+		}
+		if !errors.Is(err, errStreamStalled) {
+			errs++
+		}
+		// the picker reopens the stream on another node
+		if len(s.waiters) > 0 && c.ctx.Err() == nil && errs < c.nodes {
 			c.nextMu.Unlock()
 			continue
 		}
@@ -127,9 +136,7 @@ func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration
 
 	ctx, cancel := context.WithCancelCause(c.ctx)
 	defer cancel(nil)
-	// The picker keeps a node that failed this stream behind the others until the next node had time to stall too,
-	// so consecutive reopens go through every node.
-	ctx = context.WithValue(ctx, streamPenaltyKey{}, stall+2*c.maxBackoff)
+	ctx = context.WithValue(ctx, streamPenaltyKey{}, c.streamPenalty(stall))
 	// a node can keep the connection up without emitting beacons
 	var watchdog *time.Timer
 	if stall > 0 {
@@ -158,6 +165,12 @@ func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration
 		}
 		c.nextMu.Unlock()
 	}
+}
+
+// streamPenalty returns how long the picker keeps a node that failed the stream behind the others: until every other
+// node had time to stall, so consecutive reopens go through every node.
+func (c *Client) streamPenalty(stall time.Duration) time.Duration {
+	return time.Duration(max(c.nodes-1, 1))*(stall+c.maxBackoff) + c.maxBackoff
 }
 
 // streamError returns errStreamStalled when the watchdog is what ended the stream, err otherwise.

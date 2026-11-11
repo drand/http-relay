@@ -136,3 +136,57 @@ func TestPickerFailover(t *testing.T) {
 		})
 	}
 }
+
+func TestStreamPenaltyCoversEveryNode(t *testing.T) {
+	const stall = time.Minute
+	addrs := []string{"a", "b", "c", "d", "e"}
+	for n := 2; n <= len(addrs); n++ {
+		c := newClient(nil, nil)
+		c.nodes = n
+		ctx := context.WithValue(context.Background(), streamPenaltyKey{}, c.streamPenalty(stall))
+		fb := newTestBalancer(addrs[:n]...)
+		p := &picker{fb: fb}
+		start := time.Now()
+		// each node stalls in turn, a stall and a backoff after the previous one
+		for i, want := range addrs[:n] {
+			fb.resetPriorities(start.Add(time.Duration(i) * (stall + c.maxBackoff)))
+			res, err := p.Pick(balancer.PickInfo{Ctx: ctx})
+			if err != nil {
+				t.Fatalf("%d nodes: Pick %d: %v", n, i, err)
+			}
+			if got := res.Metadata["target"][0]; got != want {
+				t.Fatalf("%d nodes: Pick %d = %s, want %s", n, i, got, want)
+			}
+			res.Done(balancer.DoneInfo{Err: status.Error(codes.Unavailable, "stalled")})
+		}
+		c.cancel()
+	}
+}
+
+func TestPenaltyKeepsLongerDeadline(t *testing.T) {
+	fb := newTestBalancer("a", "b")
+	p := &picker{fb: fb}
+	long := context.WithValue(context.Background(), streamPenaltyKey{}, time.Hour)
+	unavailable := status.Error(codes.Unavailable, "node down")
+	for i, pk := range []struct {
+		ctx  context.Context
+		want string
+	}{{long, "a"}, {context.Background(), "b"}, {context.Background(), "a"}} {
+		res, err := p.Pick(balancer.PickInfo{Ctx: pk.ctx})
+		if err != nil {
+			t.Fatalf("Pick %d: %v", i, err)
+		}
+		if got := res.Metadata["target"][0]; got != pk.want {
+			t.Fatalf("Pick %d = %s, want %s", i, got, pk.want)
+		}
+		res.Done(balancer.DoneInfo{Err: unavailable})
+	}
+	fb.resetPriorities(time.Now().Add(time.Minute))
+	res, err := p.Pick(balancer.PickInfo{Ctx: context.Background()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.Metadata["target"][0]; got != "b" {
+		t.Errorf("Pick after the short penalties ended = %s, want b", got)
+	}
+}
