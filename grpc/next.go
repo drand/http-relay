@@ -9,11 +9,16 @@ import (
 	proto "github.com/drand/drand/v2/protobuf/drand"
 )
 
-var errClientClosed = errors.New("grpc client closed")
+var (
+	errClientClosed  = errors.New("grpc client closed")
+	errStreamStalled = errors.New("no beacon received in time")
+)
 
 const (
 	defaultMinBackoff = 100 * time.Millisecond
 	defaultMaxBackoff = 5 * time.Second
+	// stallPeriods is how many periods a stream may stay silent before it is reopened.
+	stallPeriods = 2
 )
 
 type nextResult struct {
@@ -33,7 +38,7 @@ type sharedStream struct {
 }
 
 // Next blocks until the network designated in the metadata emits its next beacon. Concurrent callers for the same
-// chain share one upstream stream, which stays open until it fails or the Client is closed.
+// chain share one upstream stream, which stays open until it fails, stalls or the Client is closed.
 func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error) {
 	// A beacon ID and a chain hash can designate the same chain, the canonical hash keeps them on one stream.
 	// It also means unknown chains fail here, before they can create any state.
@@ -62,7 +67,8 @@ func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error
 	s.waiters[ch] = struct{}{}
 	if !s.running {
 		s.running = true
-		go c.runStream(s, &proto.Metadata{ChainHash: info.Hash})
+		stall := stallPeriods * time.Duration(info.Period) * time.Second
+		go c.runStream(s, &proto.Metadata{ChainHash: info.Hash}, stall)
 	}
 	c.nextMu.Unlock()
 
@@ -77,10 +83,10 @@ func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error
 	}
 }
 
-// runStream serves the waiters of s until the stream fails or the Client is closed, then fails the remaining
-// waiters. The next call to Next starts it again.
-func (c *Client) runStream(s *sharedStream, m *proto.Metadata) {
-	err := c.receive(s, m)
+// runStream serves the waiters of s until the stream fails, stays silent for stall or the Client is closed, then
+// fails the remaining waiters. The next call to Next starts it again.
+func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Duration) {
+	err := c.receive(s, m, stall)
 	if c.ctx.Err() != nil {
 		err = errClientClosed
 	} else {
@@ -98,7 +104,7 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata) {
 	}
 }
 
-func (c *Client) receive(s *sharedStream, m *proto.Metadata) error {
+func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration) error {
 	c.nextMu.Lock()
 	wait := time.Until(s.retryAt)
 	c.nextMu.Unlock()
@@ -110,16 +116,26 @@ func (c *Client) receive(s *sharedStream, m *proto.Metadata) error {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(c.ctx)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(c.ctx)
+	defer cancel(nil)
+	// A node can keep the connection up without emitting beacons. Reopening the stream goes through the picker
+	// again, which is the only way off such a node.
+	var watchdog *time.Timer
+	if stall > 0 {
+		watchdog = time.AfterFunc(stall, func() { cancel(errStreamStalled) })
+		defer watchdog.Stop()
+	}
 	stream, err := c.pc.PublicRandStream(ctx, &proto.PublicRandRequest{Metadata: m})
 	if err != nil {
-		return fmt.Errorf("opening public rand stream: %w", err)
+		return fmt.Errorf("opening public rand stream: %w", streamError(ctx, err))
 	}
 	for {
 		resp, err := stream.Recv()
 		if err != nil {
-			return fmt.Errorf("public rand stream: %w", err)
+			return fmt.Errorf("public rand stream: %w", streamError(ctx, err))
+		}
+		if watchdog != nil {
+			watchdog.Reset(stall)
 		}
 
 		c.nextMu.Lock()
@@ -131,6 +147,14 @@ func (c *Client) receive(s *sharedStream, m *proto.Metadata) error {
 		}
 		c.nextMu.Unlock()
 	}
+}
+
+// streamError returns errStreamStalled when the watchdog is what ended the stream, err otherwise.
+func streamError(ctx context.Context, err error) error {
+	if errors.Is(context.Cause(ctx), errStreamStalled) {
+		return errStreamStalled
+	}
+	return err
 }
 
 // backoff returns how long to wait before reopening a stream that failed the given number of times in a row.

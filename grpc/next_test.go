@@ -14,6 +14,8 @@ import (
 	"google.golang.org/grpc"
 )
 
+const fakePeriod = 3
+
 var (
 	fakeChainHash = []byte{0xde, 0xad, 0xbe, 0xef}
 	byBeaconID    = &proto.Metadata{BeaconID: "default"}
@@ -53,7 +55,7 @@ func (n *fakeNode) ChainInfo(_ context.Context, in *proto.ChainInfoRequest, _ ..
 		return nil, errors.New("unknown chain")
 	}
 	return &proto.ChainInfoPacket{
-		Period:   3,
+		Period:   fakePeriod,
 		Metadata: &proto.Metadata{BeaconID: "default", ChainHash: fakeChainHash},
 	}, nil
 }
@@ -98,8 +100,8 @@ func TestNextSharesStream(t *testing.T) {
 		callers []*proto.Metadata
 		// cancelled lists the callers that give up before a beacon arrives
 		cancelled []int
-		// failFirst breaks the first stream while the callers wait, they then call Next again
-		failFirst   bool
+		// failures is how many streams in a row break while the callers wait, they call Next again each time
+		failures    int
 		wantStreams int
 	}{
 		{
@@ -124,10 +126,10 @@ func TestNextSharesStream(t *testing.T) {
 			wantStreams: 1,
 		},
 		{
-			name:        "stream error then recovery",
+			name:        "stream errors then recovery",
 			callers:     []*proto.Metadata{byBeaconID, byChainHash, byBeaconID},
-			failFirst:   true,
-			wantStreams: 2,
+			failures:    2,
+			wantStreams: 3,
 		},
 	}
 
@@ -148,10 +150,19 @@ func TestNextSharesStream(t *testing.T) {
 						t.Errorf("cancelled Next(caller %d) error = %v, want %v", i, res.err, context.Canceled)
 					}
 					callers[i] = nil
+
+					waiting := len(callers) - slices.Index(tt.cancelled, i) - 1
+					c.nextMu.Lock()
+					for key, s := range c.streams {
+						if len(s.waiters) != waiting {
+							t.Errorf("stream %s has %d waiters after %d cancellations, want %d", key, len(s.waiters), len(callers)-waiting, waiting)
+						}
+					}
+					c.nextMu.Unlock()
 				}
 
-				if tt.failFirst {
-					node.opened()[0].recv <- recvResult{err: errStream}
+				for n := range tt.failures {
+					node.opened()[n].recv <- recvResult{err: errStream}
 					for i, m := range callers {
 						if m == nil {
 							continue
@@ -161,9 +172,17 @@ func TestNextSharesStream(t *testing.T) {
 						}
 					}
 					results, _ = callNext(c, callers)
-					// the bubble's fake clock makes this instant
-					time.Sleep(c.maxBackoff)
+					// the backoff doubles with each failure, the stream must reopen exactly when it ends
+					time.Sleep(c.minBackoff<<n - time.Nanosecond)
 					synctest.Wait()
+					if got := len(node.opened()); got != n+1 {
+						t.Fatalf("opened %d streams before the backoff of failure %d ended, want %d", got, n+1, n+1)
+					}
+					time.Sleep(time.Nanosecond)
+					synctest.Wait()
+					if got := len(node.opened()); got != n+2 {
+						t.Fatalf("opened %d streams after the backoff of failure %d, want %d", got, n+1, n+2)
+					}
 				}
 
 				streams := node.opened()
@@ -215,6 +234,49 @@ func TestNextSharesStream(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestNextStalledStream(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		node := &fakeNode{}
+		c := newClient(node, slog.New(slog.DiscardHandler))
+		defer c.cancel()
+		stall := stallPeriods * fakePeriod * time.Second
+
+		results, _ := callNext(c, []*proto.Metadata{byBeaconID})
+		time.Sleep(stall - time.Nanosecond)
+		synctest.Wait()
+		node.opened()[0].recv <- recvResult{resp: &proto.PublicRandResponse{Round: 42}}
+		if res := <-results[0]; res.err != nil {
+			t.Fatalf("Next() just before the stall timeout = %v, %v, want a beacon", res.beacon, res.err)
+		}
+
+		// the beacon restarted the timeout
+		results, _ = callNext(c, []*proto.Metadata{byBeaconID})
+		time.Sleep(stall - time.Nanosecond)
+		synctest.Wait()
+		select {
+		case res := <-results[0]:
+			t.Fatalf("Next() returned %v, %v before the stall timeout, want it to wait", res.beacon, res.err)
+		default:
+		}
+		time.Sleep(time.Nanosecond)
+		if res := <-results[0]; !errors.Is(res.err, errStreamStalled) {
+			t.Fatalf("Next() on stalled stream = %v, %v, want error %v", res.beacon, res.err, errStreamStalled)
+		}
+
+		results, _ = callNext(c, []*proto.Metadata{byBeaconID})
+		time.Sleep(c.minBackoff)
+		synctest.Wait()
+		streams := node.opened()
+		if len(streams) != 2 {
+			t.Fatalf("opened %d streams after a stall, want 2", len(streams))
+		}
+		streams[1].recv <- recvResult{resp: &proto.PublicRandResponse{Round: 43}}
+		if res := <-results[0]; res.err != nil || res.beacon.Round != 43 {
+			t.Errorf("Next() on reopened stream = %v, %v, want round 43", res.beacon, res.err)
+		}
+	})
 }
 
 func TestNextUnknownChain(t *testing.T) {
