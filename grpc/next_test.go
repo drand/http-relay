@@ -33,6 +33,12 @@ type fakeStream struct {
 	recv chan recvResult
 }
 
+// skipped reports whether the stream asked the picker to skip the preferred node.
+func (s *fakeStream) skipped() bool {
+	skip, _ := s.ctx.Value(SkipCtxKey{}).(bool)
+	return skip
+}
+
 func (s *fakeStream) Recv() (*proto.PublicRandResponse, error) {
 	select {
 	case <-s.ctx.Done():
@@ -255,27 +261,46 @@ func TestNextStalledStream(t *testing.T) {
 		results, _ = callNext(c, []*proto.Metadata{byBeaconID})
 		time.Sleep(stall - time.Nanosecond)
 		synctest.Wait()
-		select {
-		case res := <-results[0]:
-			t.Fatalf("Next() returned %v, %v before the stall timeout, want it to wait", res.beacon, res.err)
-		default:
-		}
-		time.Sleep(time.Nanosecond)
-		if res := <-results[0]; !errors.Is(res.err, errStreamStalled) {
-			t.Fatalf("Next() on stalled stream = %v, %v, want error %v", res.beacon, res.err, errStreamStalled)
+		if got := len(node.opened()); got != 1 {
+			t.Fatalf("opened %d streams before the stall timeout, want 1", got)
 		}
 
-		results, _ = callNext(c, []*proto.Metadata{byBeaconID})
-		time.Sleep(c.minBackoff)
+		// each stall reopens the stream, alternating between skipping the preferred node and not
+		wantSkips := []bool{false, true, false}
+		time.Sleep(time.Nanosecond + c.minBackoff)
+		synctest.Wait()
+		time.Sleep(stall + 2*c.minBackoff)
 		synctest.Wait()
 		streams := node.opened()
-		if len(streams) != 2 {
-			t.Fatalf("opened %d streams after a stall, want 2", len(streams))
+		if len(streams) != len(wantSkips) {
+			t.Fatalf("opened %d streams after two stalls, want %d", len(streams), len(wantSkips))
 		}
-		streams[1].recv <- recvResult{resp: &proto.PublicRandResponse{Round: 43}}
+		for i, want := range wantSkips {
+			if got := streams[i].skipped(); got != want {
+				t.Errorf("stream %d skipped the preferred node = %t, want %t", i, got, want)
+			}
+		}
+
+		streams[2].recv <- recvResult{resp: &proto.PublicRandResponse{Round: 43}}
 		if res := <-results[0]; res.err != nil || res.beacon.Round != 43 {
-			t.Errorf("Next() on reopened stream = %v, %v, want round 43", res.beacon, res.err)
+			t.Errorf("Next() across stalls = %v, %v, want round 43", res.beacon, res.err)
 		}
+
+		// without waiters, a stall closes the stream for good
+		time.Sleep(stall)
+		synctest.Wait()
+		time.Sleep(c.maxBackoff)
+		synctest.Wait()
+		if got := len(node.opened()); got != len(wantSkips) {
+			t.Errorf("opened %d streams after a stall without waiters, want %d", got, len(wantSkips))
+		}
+		c.nextMu.Lock()
+		for key, s := range c.streams {
+			if s.running {
+				t.Errorf("stream %s still running after a stall without waiters", key)
+			}
+		}
+		c.nextMu.Unlock()
 	})
 }
 
