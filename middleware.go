@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -30,8 +31,8 @@ func prometheusMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// drandHandler is setting all the routes and middleware we need for a drand relay
-func drandHandler(client *grpc.Client) http.Handler {
+// drandHandler is setting all the routes and middleware we need for a drand relay. Request logs go to logWriter.
+func drandHandler(client *grpc.Client, logWriter io.Writer) http.Handler {
 	// setup the chi router
 	r := chi.NewRouter()
 
@@ -45,6 +46,7 @@ func drandHandler(client *grpc.Client) http.Handler {
 		Concise:         !(*verbose),
 		ResponseHeaders: *verbose,
 		RequestHeaders:  false,
+		Writer:          logWriter,
 		QuietDownRoutes: []string{
 			"/",
 			"/ping",
