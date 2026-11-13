@@ -45,9 +45,11 @@ func (s *fakeStream) Recv() (*proto.PublicRandResponse, error) {
 	}
 }
 
-// fakeNode serves a single chain, known both as beacon ID "default" and as fakeChainHash.
+// fakeNode serves a single chain, known both as beacon ID "default" and as fakeChainHash. Its streams fail with fail
+// when it is set.
 type fakeNode struct {
 	proto.PublicClient
+	fail    error
 	mu      sync.Mutex
 	streams []*fakeStream
 }
@@ -66,7 +68,10 @@ func (n *fakeNode) ChainInfo(_ context.Context, in *proto.ChainInfoRequest, _ ..
 func (n *fakeNode) PublicRandStream(ctx context.Context, _ *proto.PublicRandRequest, _ ...grpc.CallOption) (proto.Public_PublicRandStreamClient, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	s := &fakeStream{ctx: ctx, recv: make(chan recvResult)}
+	s := &fakeStream{ctx: ctx, recv: make(chan recvResult, 1)}
+	if n.fail != nil {
+		s.recv <- recvResult{err: n.fail}
+	}
 	n.streams = append(n.streams, s)
 	return s, nil
 }
@@ -296,32 +301,98 @@ func TestNextStalledStream(t *testing.T) {
 	})
 }
 
-func TestNextStreamErrorTriesEveryNode(t *testing.T) {
+func TestNextStreamErrorOnEveryNodeWaitsOneBackoff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		node := &fakeNode{}
+		tb := newTestBalancer("a", "b", "c")
+		tb.now = time.Now
+		errStream := errors.New("beacon has not started on this node yet")
+		node := &balancedNode{fakeNode: fakeNode{fail: errStream}, tb: tb}
 		c := newClient(node, slog.New(slog.DiscardHandler))
 		defer c.cancel()
 		c.nodes = 3
-		errStream := errors.New("beacon has not started on this node yet")
 
-		results, _ := callNext(c, []*proto.Metadata{byBeaconID})
-		for n := range c.nodes {
-			synctest.Wait()
-			select {
-			case res := <-results[0]:
-				t.Fatalf("Next() after %d stream errors = %v, %v, want it to keep waiting", n, res.beacon, res.err)
-			default:
+		// the backoff reaches maxBackoff after the first calls
+		for i := range 5 {
+			before, start := len(node.pickedNodes()), time.Now()
+			if b, err := c.Next(context.Background(), byBeaconID); !errors.Is(err, errStream) {
+				t.Fatalf("Next() %d = %v, %v, want error %v", i, b, err, errStream)
 			}
-			node.opened()[n].recv <- recvResult{err: errStream}
-			time.Sleep(c.maxBackoff)
+			if elapsed := time.Since(start); elapsed > c.maxBackoff {
+				t.Errorf("Next() %d returned after %v, want at most %v", i, elapsed, c.maxBackoff)
+			}
+			if got, want := node.pickedNodes()[before:], []string{"a", "b", "c"}; !slices.Equal(got, want) {
+				t.Errorf("Next() %d opened streams on %v, want %v", i, got, want)
+			}
 		}
-		if res := <-results[0]; !errors.Is(res.err, errStream) {
-			t.Errorf("Next() after an error on every node = %v, %v, want error %v", res.beacon, res.err, errStream)
+		checkNoPenalty(t, tb)
+	})
+}
+
+func TestNextNoNodeToPick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tb := newTestBalancer("a", "b", "c")
+		tb.ready()
+		node := &balancedNode{tb: tb}
+		c := newClient(node, slog.New(slog.DiscardHandler))
+		defer c.cancel()
+		c.nodes = 3
+
+		if b, err := c.Next(context.Background(), byBeaconID); !errors.Is(err, balancer.ErrNoSubConnAvailable) {
+			t.Errorf("Next() without READY node = %v, %v, want error %v", b, err, balancer.ErrNoSubConnAvailable)
 		}
-		if got, want := len(node.opened()), c.nodes; got != want {
-			t.Errorf("opened %d streams, want %d", got, want)
+		if got := len(node.pickedNodes()); got != 0 {
+			t.Errorf("Next() without READY node opened %d streams, want 0", got)
 		}
 	})
+}
+
+// TestNextSlowPick checks that the stall window starts once the stream is open, and that a stall while waiting for a
+// node blames none.
+func TestNextSlowPick(t *testing.T) {
+	stall := stallPeriods * fakePeriod * time.Second
+	tests := []struct {
+		name       string
+		delay      time.Duration
+		wantPicked []string
+	}{
+		{"node READY just before the stall", stall - time.Second, []string{"a"}},
+		{"no node READY until the stall", stall + time.Second, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				tb := newTestBalancer("a", "b", "c")
+				tb.now = time.Now
+				node := &balancedNode{tb: tb, openDelay: tt.delay}
+				c := newClient(node, slog.New(slog.DiscardHandler))
+				defer c.cancel()
+				c.nodes = 3
+
+				results, _ := callNext(c, []*proto.Metadata{byBeaconID})
+				// a beacon after the stall measured from the call, within the stall measured from the open
+				time.Sleep(stall + stall/2)
+				synctest.Wait()
+				if got := node.pickedNodes(); !slices.Equal(got, tt.wantPicked) {
+					t.Fatalf("stream opened on %v, want %v", got, tt.wantPicked)
+				}
+				c.nextMu.Lock()
+				for key, s := range c.streams {
+					if len(s.failed) != 0 {
+						t.Errorf("stream %s failed on %v, want no node", key, s.failed)
+					}
+				}
+				c.nextMu.Unlock()
+				if tt.wantPicked != nil {
+					node.opened()[0].recv <- recvResult{resp: &proto.PublicRandResponse{Round: 42}}
+					if res := <-results[0]; res.err != nil || res.beacon.Round != 42 {
+						t.Errorf("Next() = %v, %v, want round 42", res.beacon, res.err)
+					}
+				}
+				c.cancel()
+				synctest.Wait()
+			})
+		})
+	}
 }
 
 func TestNextUnknownChain(t *testing.T) {
@@ -353,14 +424,21 @@ func TestNextClosedClient(t *testing.T) {
 	})
 }
 
-// balancedNode opens its streams on the node the picker of tb chooses, and reports to the picker how they ended.
+// balancedNode opens its streams on the node the picker of tb chooses, after openDelay as if it waited for a READY
+// node, and reports to the picker how they ended.
 type balancedNode struct {
 	fakeNode
-	tb     *testBalancer
-	picked []string // guarded by fakeNode.mu
+	tb        *testBalancer
+	openDelay time.Duration
+	picked    []string // guarded by fakeNode.mu
 }
 
 func (n *balancedNode) PublicRandStream(ctx context.Context, in *proto.PublicRandRequest, opts ...grpc.CallOption) (proto.Public_PublicRandStreamClient, error) {
+	select {
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	case <-time.After(n.openDelay):
+	}
 	res, err := (&picker{fb: n.tb.fallbackBalancer}).Pick(balancer.PickInfo{Ctx: ctx})
 	if err != nil {
 		return nil, err

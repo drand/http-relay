@@ -92,9 +92,14 @@ func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error
 // remaining waiters. A stalled stream is reopened as long as it has waiters, which keep waiting. Each reopen goes to a
 // node that has not failed since the last beacon, or else to the one that failed longest ago, so a halted chain walks
 // the nodes round after round. The next call to Next starts it again, still avoiding those nodes.
+//
+// A reopen waits for the backoff only when it cannot go to a node not yet tried since the last beacon, so the callers
+// of a chain failing on every node get their error after one backoff at most. The stream fails its callers at once
+// when no node could be picked.
 func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Duration) {
-	// errors other than stalls since the last beacon
+	// errors other than stalls, and nodes tried, since the last beacon
 	errs := 0
+	tried := make(map[string]bool)
 	for {
 		addr, err := c.receive(s, m, stall)
 		if c.ctx.Err() != nil {
@@ -109,14 +114,21 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 		if s.failures == 1 {
 			// a beacon arrived since the previous failure
 			errs = 0
+			clear(tried)
 		}
-		if !errors.Is(err, errStreamStalled) {
+		stalled := errors.Is(err, errStreamStalled)
+		if !stalled {
 			errs++
 		}
 		if addr != "" {
 			s.failed = append(slices.DeleteFunc(s.failed, func(a string) bool { return a == addr }), addr)
 		}
-		if len(s.waiters) > 0 && c.ctx.Err() == nil && errs < c.nodes {
+		if len(s.waiters) > 0 && c.ctx.Err() == nil && errs < c.nodes && (addr != "" || stalled) {
+			if addr != "" && !tried[addr] {
+				// the picker reopens on another node, at most once per node until a beacon arrives
+				tried[addr] = true
+				s.retryAt = time.Time{}
+			}
 			c.nextMu.Unlock()
 			continue
 		}
@@ -155,7 +167,16 @@ func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration
 	}
 	stream, err := c.pc.PublicRandStream(ctx, &proto.PublicRandRequest{Metadata: m})
 	if err != nil {
-		return served(), fmt.Errorf("opening public rand stream: %w", streamError(ctx, err))
+		err = streamError(ctx, err)
+		if errors.Is(err, errStreamStalled) {
+			// the call waited in the picker, no node is to blame
+			return "", fmt.Errorf("opening public rand stream: %w", err)
+		}
+		return served(), fmt.Errorf("opening public rand stream: %w", err)
+	}
+	// the stall window measures the node, not the wait for a READY one
+	if watchdog != nil && !watchdog.Reset(stall) {
+		return "", fmt.Errorf("opening public rand stream: %w", errStreamStalled)
 	}
 	for {
 		resp, err := stream.Recv()
