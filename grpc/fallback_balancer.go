@@ -1,11 +1,13 @@
 package grpc
 
 import (
+	"cmp"
 	"context"
-	"fmt"
+	"errors"
+	"maps"
 	"slices"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,10 +15,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/base"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
-	"google.golang.org/grpc/serviceconfig"
+	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -32,15 +37,6 @@ var (
 var fbLog = grpclog.Component("fallbackLB")
 
 const fallbackName = "pick_first_with_fallback"
-
-// LBConfig is the balancer config for pick_first_with_fallback balancer.
-type LBConfig struct {
-	serviceconfig.LoadBalancingConfig `json:"-"`
-
-	// FallbackSeconds is the number of seconds the fallbackBalancer should wait
-	// before attempting to fallback to its first endpoints. If set to 0, it behaves like the pick_first balancer.
-	FallbackSeconds uint32 `json:"fallbackSeconds,omitempty"`
-}
 
 // NewFallbackBuilder returns a fallback balancer builder configured with the given timeout, meant to be registered.
 func NewFallbackBuilder(timeout time.Duration) balancer.Builder {
@@ -60,241 +56,225 @@ func (fallbackBB) Name() string {
 }
 
 func (f fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Balancer {
-	b := &fallbackBalancer{scAddrs: make(map[balancer.SubConn]*scWithAddr), closing: make(chan struct{})}
+	fb := newFallbackBalancer(f.timeout)
 	// we delegate the actual SubConn management to the base balancer
-	baseBuilder := base.NewBalancerBuilder(fallbackName, b,
+	baseBuilder := base.NewBalancerBuilder(fallbackName, fb,
 		base.Config{
 			//TODO: understand better whether or not we want to rely on the built-in grpc HealthCheck
 			HealthCheck: false,
 		})
-	b.Balancer = baseBuilder.Build(cc, bOpts)
-	go b.runBackgroundTimer(f.timeout)
-	return b
+	fb.Balancer = baseBuilder.Build(failureWatcher{cc, fb}, bOpts)
+	return fb
 }
 
+// fallbackBalancer sends every call to the first configured node that is READY and not penalized. A node that fails a
+// call is penalized: it goes behind the others until its penalty ends.
 type fallbackBalancer struct {
 	// Embeds balancer.Balancer because needs to intercept UpdateClientConnState to learn state.
 	balancer.Balancer
+	// timeout is how long a node stays behind the others after failing a call.
+	timeout time.Duration
+	now     func() time.Time
 
-	mu sync.RWMutex
-
-	scAddrs map[balancer.SubConn]*scWithAddr // Hold onto SubConn address to keep track for subsequent picker updates.
-	closing chan struct{}
+	mu    sync.Mutex // guards nodes and the writes to current
+	nodes map[string]*node
+	// current lets Pick read the choice without the lock. It is nil when no node is READY.
+	current atomic.Pointer[choice]
 }
 
-// Function to continuously process updates
-func (fb *fallbackBalancer) runBackgroundTimer(timeout time.Duration) {
-	ticker := time.NewTimer(timeout)
-	for {
-		select {
-		case <-ticker.C:
-			fb.mu.Lock()
-			// every tick, we reset the priority of all subconn, the ones whose underlying SubConn is actually not READY
-			// are deleted from that list anyway in UpdateClientConnState.
-			for _, sc := range fb.scAddrs {
-				sc.ResetPriority()
-			}
-			fb.mu.Unlock()
-			ticker.Reset(timeout)
-		case <-fb.closing:
-			fbLog.Info("received a Close, shutting down fallback balancer")
-			fb.mu.Lock()
-			ticker.Stop()
-			// we empty the balancer
-			for sc := range fb.scAddrs {
-				delete(fb.scAddrs, sc)
-			}
-			fb.mu.Unlock()
-			// now we call the underlying balancer Close() managing the actual SubConn
-			// this is the one that will be calling Shutdown on each SubConn
-			// as will be mandated in a future go-grpc release.
-			fb.Balancer.Close()
-			return
+func newFallbackBalancer(timeout time.Duration) *fallbackBalancer {
+	return &fallbackBalancer{timeout: timeout, now: time.Now, nodes: make(map[string]*node)}
+}
+
+// node is a configured address. It outlives its SubConns so that a node keeps its penalty across reconnections.
+type node struct {
+	addr           string
+	order          int
+	sc             balancer.SubConn // nil unless READY
+	failedAt       time.Time
+	penalizedUntil time.Time
+}
+
+// choice is an immutable snapshot of the node to pick.
+type choice struct {
+	sc   balancer.SubConn
+	addr string
+	// validUntil is when the first penalty among the READY nodes ends, zero if none is penalized.
+	validUntil time.Time
+}
+
+// rank returns the READY nodes in the order to pick them at now:
+//
+//	unpenalized nodes  first, by configured order
+//	penalized nodes    last, oldest failure first, then by configured order
+//
+// A penalty ends at penalizedUntil.
+func rank(nodes []*node, now time.Time) []*node {
+	ready := slices.DeleteFunc(slices.Clone(nodes), func(n *node) bool { return n.sc == nil })
+	slices.SortFunc(ready, func(a, b *node) int {
+		aPenalized, bPenalized := now.Before(a.penalizedUntil), now.Before(b.penalizedUntil)
+		switch {
+		case aPenalized && !bPenalized:
+			return 1
+		case !aPenalized && bPenalized:
+			return -1
+		case aPenalized:
+			return cmp.Or(a.failedAt.Compare(b.failedAt), cmp.Compare(a.order, b.order))
+		}
+		return cmp.Compare(a.order, b.order)
+	})
+	return ready
+}
+
+// refresh stores the choice ranked at now. It is the only writer of current, and fb.mu must be held.
+func (fb *fallbackBalancer) refresh(now time.Time) {
+	ranked := rank(slices.Collect(maps.Values(fb.nodes)), now)
+	if len(ranked) == 0 {
+		fb.current.Store(nil)
+		return
+	}
+	c := &choice{sc: ranked[0].sc, addr: ranked[0].addr}
+	for _, n := range ranked {
+		if now.Before(n.penalizedUntil) && (c.validUntil.IsZero() || n.penalizedUntil.Before(c.validUntil)) {
+			c.validUntil = n.penalizedUntil
 		}
 	}
+	fb.current.Store(c)
 }
 
-func (fb *fallbackBalancer) Close() {
-	close(fb.closing)
-}
-
-func (fb *fallbackBalancer) dec(sc balancer.SubConn) {
+// choose returns the current choice, refreshed first if a penalty ended since it was made.
+func (fb *fallbackBalancer) choose() *choice {
+	c := fb.current.Load()
+	if c == nil || c.validUntil.IsZero() || fb.now().Before(c.validUntil) {
+		return c
+	}
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
-	if sca, ok := fb.scAddrs[sc]; !ok {
-		fbLog.Error("trying to update state on a non-existent subconn", "subconn", sc)
-	} else {
-		// -2 to increase the chance of having another higher priority conn available
-		sca.UpdatePriority(-2)
-	}
+	fb.refresh(fb.now())
+	return fb.current.Load()
 }
 
-// first returns the subconn with the highest priority among the ones available.
-// It can return a nil subconn if none are ready, this must be handled by the caller.
-func (fb *fallbackBalancer) first() *scWithAddr {
-	fb.mu.RLock()
-	defer fb.mu.RUnlock()
-	// quick path for the case with a single subconn
-	if len(fb.scAddrs) == 1 {
-		for _, sca := range fb.scAddrs {
-			return sca
+// penalize puts the node at addr behind the others for at least d, whether or not it is READY.
+func (fb *fallbackBalancer) penalize(addr string, d time.Duration) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	n, ok := fb.nodes[addr]
+	if !ok {
+		// the resolver removed it
+		return
+	}
+	fbLog.Warning("penalizing node", "addr", addr, "for", d)
+	now := fb.now()
+	n.failedAt = now
+	if until := now.Add(d); until.After(n.penalizedUntil) {
+		n.penalizedUntil = until
+	}
+	fb.refresh(now)
+}
+
+// other returns the best-ranked READY node not in avoid, or else the READY node that comes first in avoid, nil if no
+// node is READY.
+func (fb *fallbackBalancer) other(avoid []string) *choice {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	for _, n := range rank(slices.Collect(maps.Values(fb.nodes)), fb.now()) {
+		if !slices.Contains(avoid, n.addr) {
+			return &choice{sc: n.sc, addr: n.addr}
 		}
 	}
-	// in case scAddrs is empty, we need at least 1 nil and 1 cap
-	ret := make([]*scWithAddr, 1, len(fb.scAddrs)+1)
-	for _, sca := range fb.scAddrs {
-		// we insert in correct order, by priority
-		ret = insert(ret, sca)
+	for _, addr := range avoid {
+		if n, ok := fb.nodes[addr]; ok && n.sc != nil {
+			return &choice{sc: n.sc, addr: addr}
+		}
 	}
-
-	return ret[0]
+	return nil
 }
 
-func (fb *fallbackBalancer) second() *scWithAddr {
-	fb.mu.RLock()
-	defer fb.mu.RUnlock()
-	// quick path for the case with a single subconn or none
-	if len(fb.scAddrs) < 2 {
-		return nil
-	}
-	ret := make([]*scWithAddr, 0, len(fb.scAddrs))
-	for _, sca := range fb.scAddrs {
-		// we insert in correct order, by priority
-		ret = insert(ret, sca)
-	}
-
-	return ret[1]
-}
-
+// UpdateClientConnState keeps one node per address before the base balancer creates their SubConns.
 func (fb *fallbackBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
-	addrs := s.ResolverState.Addresses
-	fbLog.Info("Called UpdateClientConnState with addresses", len(addrs))
-	if len(addrs) == 0 {
-		fb.mu.Lock()
-		// The resolver reported an empty address list.
-		// Treat it like an error by calling b.ResolverError.
-		// In theory this should never happen with our own custom resolver
-		for sc, addr := range fb.scAddrs {
-			// Shut down the old subConn. All addresses were removed, so it is no longer valid.
-			sc.Shutdown()
-			fbLog.Info("shutting down SubConn", "addr", addr)
-			delete(fb.scAddrs, sc)
-		}
-		fb.mu.Unlock()
-		fbLog.Warning("resolver provided zero addresses")
-		// TODO: is this true?
-		// it's important to shutdown all SubConn above since ResolverError relies on len(ReadySC) to re-resolve
-		fb.ResolverError(fmt.Errorf("resolver provided zero addresses"))
-		return balancer.ErrBadResolverState
-	}
-
+	fbLog.Info("Called UpdateClientConnState with addresses", len(s.ResolverState.Addresses))
+	// Without addresses, the base balancer shuts every SubConn down, reports a resolver error and returns
+	// balancer.ErrBadResolverState.
+	s.ResolverState.Addresses = fb.setAddresses(s.ResolverState.Addresses)
 	return fb.Balancer.UpdateClientConnState(s)
 }
 
-type scWithAddr struct {
-	sc balancer.SubConn
-	// the underlying target's address
-	addr string
-	// whether this SubConn is currently considered ready or not. Negative priority disables it.
-	priority int
-	// order is used to prioritize the SubConn to use, a negative one leads to it not being used at all
-	order int
-
-	// we can have concurrent updates of the priority, so we need to guard our scWithAddr with a mutex
-	mu sync.RWMutex
-}
-
-func (s *scWithAddr) String() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return fmt.Sprintf("%d(%d)-%s", s.priority, s.order, s.addr)
-}
-
-func (s *scWithAddr) ResetPriority() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.priority = s.order
-}
-
-func (s *scWithAddr) UpdatePriority(update int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.priority += update
-}
-
-// scCmp should return 0 if the slice element s matches
-// the target t, a negative number if the slice element s precedes the target t,
-// or a positive number if the slice element s follows the target t.
-// cmp must implement the same ordering as the slice, such that if
-// cmp(a, t) < 0 and cmp(b, t) >= 0, then a must precede b in the slice.
-// For nil values, we consider them "larger" than anything
-func scCmp(s, t *scWithAddr) int {
-	if s == nil {
-		return 1
-	} else if t == nil {
-		return -1
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.priority - t.priority
-}
-
-// insert will insert s in scs in a sorted way, relying on the above comparison function. It will be in ascending order.
-func insert(scs []*scWithAddr, s *scWithAddr) []*scWithAddr {
-	if s == nil {
-		return scs
-	}
-	i, _ := slices.BinarySearchFunc(scs, s, scCmp) // find slot
-	return slices.Insert(scs, i, s)
-}
-
-// Build is implementing the base.PickerBuilder interface, expecting a ReadySCs list of SubConn that are ready to
-// be used, and we build our list of addresses using it.
-func (fb *fallbackBalancer) Build(info base.PickerBuildInfo) balancer.Picker {
-	fbLog.Info("fallbackPicker built called", "#readySC", len(info.ReadySCs))
-	if len(info.ReadySCs) == 0 {
-		return base.NewErrPicker(balancer.ErrNoSubConnAvailable)
-	}
-
+// setAddresses reconciles the nodes with addrs, and returns addrs without the ones that lack an order or repeat an
+// address: a node only keeps its lowest order, and one SubConn.
+func (fb *fallbackBalancer) setAddresses(addrs []resolver.Address) []resolver.Address {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
-
-	for sc, sca := range fb.scAddrs {
-		if _, ok := info.ReadySCs[sc]; !ok {
-			// This might mean an endpoint changed their resolved IP, which we do not handle gracefully yet
-			// but most likely means a connection is failing temporarily.
-			// We rely on the grpc built-in reconnect backoff process to re-trigger this through the baseBalancer.
-			fbLog.Warning("SubConn not ready anymore", "addr", sca.addr)
-			delete(fb.scAddrs, sc)
-		}
-	}
-
-	scs := make([]*scWithAddr, 0, len(info.ReadySCs))
-	// Create new refs if needed and add them to picker list in correct order based on their attribute
-	for sc, addr := range info.ReadySCs {
-		order, ok := addr.Address.Attributes.Value("order").(int)
+	kept := make([]resolver.Address, 0, len(addrs))
+	orders := make(map[string]int, len(addrs))
+	for _, a := range addrs {
+		order, ok := a.Attributes.Value("order").(int)
 		if !ok {
-			fbLog.Error("invalid order attribute on Address, make sure to use a compatible resolver", "addr", addr)
+			fbLog.Error("invalid order attribute on Address, make sure to use a compatible resolver", "addr", a)
 			continue
 		}
-
-		sca := &scWithAddr{
-			sc:       sc,
-			addr:     addr.Address.Addr,
-			priority: order,
-			order:    order,
+		if prev, dup := orders[a.Addr]; dup {
+			if order < prev {
+				orders[a.Addr] = order
+				kept[slices.IndexFunc(kept, func(k resolver.Address) bool { return k.Addr == a.Addr })] = a
+			}
+			continue
 		}
-
-		fbLog.Info("Processing Ready SubConn", "addr", addr.Address, "order", order)
-		// we replace the sca in our LB in case its addr or order was changed
-		fb.scAddrs[sc] = sca
+		orders[a.Addr] = order
+		kept = append(kept, a)
 	}
-
-	fbLog.Info("Prepared fallback LB picker with ready SubConns", "scs", scs)
-
-	return &picker{
-		fb: fb,
+	for addr, n := range fb.nodes {
+		order, ok := orders[addr]
+		if !ok {
+			delete(fb.nodes, addr)
+			continue
+		}
+		n.order = order
 	}
+	for addr, order := range orders {
+		if _, ok := fb.nodes[addr]; !ok {
+			fb.nodes[addr] = &node{addr: addr, order: order}
+		}
+	}
+	fb.refresh(fb.now())
+	return kept
+}
+
+// Build implements base.PickerBuilder. The base balancer calls it whenever a SubConn enters or leaves READY, except
+// when no SubConn is left READY, CONNECTING or IDLE: failureWatcher covers that case.
+func (fb *fallbackBalancer) Build(info base.PickerBuildInfo) balancer.Picker {
+	ready := make(map[string]balancer.SubConn, len(info.ReadySCs))
+	for sc, sci := range info.ReadySCs {
+		ready[sci.Address.Addr] = sc
+	}
+	fb.setReady(ready)
+	return &picker{fb: fb}
+}
+
+// setReady records which SubConn, if any, is READY for each node.
+func (fb *fallbackBalancer) setReady(ready map[string]balancer.SubConn) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	for addr, n := range fb.nodes {
+		if (n.sc == nil) != (ready[addr] == nil) {
+			fbLog.Info("node readiness changed", "addr", addr, "ready", ready[addr] != nil)
+		}
+		n.sc = ready[addr]
+	}
+	fb.refresh(fb.now())
+}
+
+// failureWatcher clears the READY nodes when the base balancer reports TRANSIENT_FAILURE, because it then installs
+// its own error picker without calling Build.
+type failureWatcher struct {
+	balancer.ClientConn
+	fb *fallbackBalancer
+}
+
+func (w failureWatcher) UpdateState(s balancer.State) {
+	if s.ConnectivityState == connectivity.TransientFailure {
+		w.fb.setReady(nil)
+	}
+	w.ClientConn.UpdateState(s)
 }
 
 type picker struct {
@@ -302,55 +282,94 @@ type picker struct {
 }
 
 func (p *picker) String() string {
-	if p == nil || p.fb == nil {
-		return "nil"
+	if c := p.fb.current.Load(); c != nil {
+		return c.addr
 	}
-	var sb strings.Builder
-	sb.WriteString("[ ")
-	first := p.fb.first()
-	if first != nil {
-		sb.WriteString(first.String() + "; ")
-	}
-	sb.WriteString("]")
-	return sb.String()
+	return "no READY node"
 }
 
-type SkipCtxKey struct{}
+type (
+	avoidKey struct{}
+	trackKey struct{}
+)
 
-func (p *picker) Pick(b balancer.PickInfo) (balancer.PickResult, error) {
-	// we rely on the 0 value of int being 0 when the key isn't set
-	skip, _ := b.Ctx.Value(SkipCtxKey{}).(bool)
+// AvoidNodes returns a context whose calls go to the best-ranked READY node not in addrs, ordered oldest failure first.
+// When every READY node is in addrs, they go to the one that comes first. The addrs add to the ones ctx already
+// avoids, as newer failures. It penalizes no node: a node that lags, or fails a single chain, keeps serving the others.
+func AvoidNodes(ctx context.Context, addrs ...string) context.Context {
+	prev, _ := ctx.Value(avoidKey{}).([]string)
+	avoid := slices.Clone(prev)
+	for _, addr := range addrs {
+		avoid = append(slices.DeleteFunc(avoid, func(a string) bool { return a == addr }), addr)
+	}
+	return context.WithValue(ctx, avoidKey{}, avoid)
+}
 
-	picked := p.fb.first()
-	fbLog.Info("considering to pick", "first", picked, "skip", skip)
-	// we got a skip context, so we'll try to see if there is a next subconn
-	if skip {
-		second := p.fb.second()
-		if second != nil {
-			fbLog.Error("skipping & deprioritizing first SubConn for now", "addr", picked.addr)
-			p.fb.dec(picked.sc)
-			picked = second
+type tracker struct {
+	last   atomic.Pointer[string]
+	parent *tracker
+}
+
+// TrackNode returns a context that records the node picked for its calls, and a function returning the address of the
+// last one picked, or "" if none was. Trackers nest: a pick is recorded by every TrackNode up the context chain. It is
+// safe for concurrent use.
+func TrackNode(ctx context.Context) (context.Context, func() string) {
+	t := &tracker{}
+	t.parent, _ = ctx.Value(trackKey{}).(*tracker)
+	return context.WithValue(ctx, trackKey{}, t), func() string {
+		if addr := t.last.Load(); addr != nil {
+			return *addr
+		}
+		return ""
+	}
+}
+
+func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+	fb := p.fb
+	c := fb.choose()
+	if c == nil {
+		fbLog.Error("Pick had no available SubConn")
+		return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
+	}
+	if avoid, ok := info.Ctx.Value(avoidKey{}).([]string); ok && slices.Contains(avoid, c.addr) {
+		if o := fb.other(avoid); o != nil {
+			c = o
 		}
 	}
-
-	if picked == nil {
-		fbLog.Error("Pick had no available SubConn", "skipped", skip)
-		return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
+	for t, _ := info.Ctx.Value(trackKey{}).(*tracker); t != nil; t = t.parent {
+		t.last.Store(&c.addr)
 	}
 
 	// The metric for a subchannel should be atomically incremented by one
 	// after it has been successfully picked by the picker
-	RequestsCounter.With(prometheus.Labels{"node": picked.addr}).Inc()
-	fbLog.Info("Picked SubConn", "addr", picked.addr, "skipped", skip)
+	RequestsCounter.With(prometheus.Labels{"node": c.addr}).Inc()
+	fbLog.Info("Picked SubConn", "addr", c.addr)
 	return balancer.PickResult{
-		SubConn: picked.sc,
-		Done: func(info balancer.DoneInfo) {
-			if info.Err != nil {
-				p.fb.dec(picked.sc)
+		SubConn: c.sc,
+		Done: func(di balancer.DoneInfo) {
+			if nodeFault(info.Ctx, di) {
+				fb.penalize(c.addr, fb.timeout)
 			}
 		},
-		Metadata: metadata.MD{"target": []string{picked.addr}},
+		Metadata: metadata.MD{"target": []string{c.addr}},
 	}, nil
+}
+
+// nodeFault reports whether the call failed because of the node, rather than the caller giving up, including on a
+// stalled stream, or asking for something the node cannot serve. drand nodes report unknown chains and rounds, and
+// chains without a beacon yet, as codes.Unknown, so only transport-level codes count. The client reports its own
+// failures, such as a request it cannot marshal, as codes.Internal before receiving anything from the node.
+func nodeFault(ctx context.Context, di balancer.DoneInfo) bool {
+	if di.Err == nil || errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	switch status.Code(di.Err) {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted, codes.Unimplemented:
+		return true
+	case codes.Internal:
+		return di.BytesReceived
+	}
+	return false
 }
 
 // UsedEndpointInterceptor is a gRPC client-side interceptor that provides reporting for which endpoint is being used by each RPC.
