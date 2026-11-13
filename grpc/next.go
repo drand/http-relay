@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"time"
 
@@ -37,9 +36,9 @@ type sharedStream struct {
 	running  bool
 	failures uint      // consecutive stream failures, reset when a beacon arrives
 	retryAt  time.Time // earliest time to reopen the stream
-	// failed holds the nodes that failed the stream since the last beacon. The stream avoids them instead of
-	// penalizing them for every chain: a node may fail one chain only, or the chain may have halted.
-	failed map[string]struct{}
+	// failed holds the nodes that failed the stream since the last beacon, oldest failure first. The stream avoids
+	// them instead of penalizing them for every chain: a node may fail one chain only, or the chain may have halted.
+	failed []string
 }
 
 // Next blocks until the network designated in the metadata emits its next beacon. Concurrent callers for the same
@@ -67,7 +66,7 @@ func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error
 	}
 	s, ok := c.streams[key]
 	if !ok {
-		s = &sharedStream{waiters: make(map[chan nextResult]struct{}), failed: make(map[string]struct{})}
+		s = &sharedStream{waiters: make(map[chan nextResult]struct{})}
 		c.streams[key] = s
 	}
 	s.waiters[ch] = struct{}{}
@@ -91,8 +90,8 @@ func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error
 
 // runStream serves the waiters of s until the stream failed on every node or the Client is closed, then fails the
 // remaining waiters. A stalled stream is reopened as long as it has waiters, which keep waiting. Each reopen goes to a
-// node that has not failed since the last beacon, so a halted chain walks the nodes round after round. The next call
-// to Next starts it again, still avoiding those nodes.
+// node that has not failed since the last beacon, or else to the one that failed longest ago, so a halted chain walks
+// the nodes round after round. The next call to Next starts it again, still avoiding those nodes.
 func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Duration) {
 	// errors other than stalls since the last beacon
 	errs := 0
@@ -115,14 +114,7 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 			errs++
 		}
 		if addr != "" {
-			if _, again := s.failed[addr]; again {
-				// the picker had no other READY node left
-				clear(s.failed)
-			}
-			s.failed[addr] = struct{}{}
-			if len(s.failed) >= c.nodes {
-				clear(s.failed)
-			}
+			s.failed = append(slices.DeleteFunc(s.failed, func(a string) bool { return a == addr }), addr)
 		}
 		if len(s.waiters) > 0 && c.ctx.Err() == nil && errs < c.nodes {
 			c.nextMu.Unlock()
@@ -142,7 +134,7 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration) (string, error) {
 	c.nextMu.Lock()
 	wait := time.Until(s.retryAt)
-	avoid := slices.Collect(maps.Keys(s.failed))
+	avoid := slices.Clone(s.failed)
 	c.nextMu.Unlock()
 	if wait > 0 {
 		select {
@@ -176,7 +168,7 @@ func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration
 
 		c.nextMu.Lock()
 		s.failures = 0
-		clear(s.failed)
+		s.failed = nil
 		for ch := range s.waiters {
 			// handlers mutate the beacon they get, so each waiter needs its own
 			ch <- nextResult{beacon: NewHexBeacon(resp)}

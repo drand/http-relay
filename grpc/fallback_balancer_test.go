@@ -176,11 +176,18 @@ func TestPickerFailover(t *testing.T) {
 		}},
 		{"avoid picks the next node for that call only", []pick{{nil, 0, avoidA, nil, "b"}, {nil, 0, ctx, nil, "a"}}},
 		{"avoid of several nodes picks the best other", []pick{{nil, 0, avoidAB, nil, "c"}, {nil, 0, ctx, nil, "a"}}},
-		{"avoid of every READY node keeps the usual node", []pick{
-			{[]string{"a", "b"}, 0, avoidAB, nil, "a"}, {nil, 0, AvoidNodes(ctx, "b", "c", "a"), nil, "a"},
+		{"avoid of every READY node picks the first in the list", []pick{
+			{[]string{"a", "b"}, 0, AvoidNodes(ctx, "b", "a"), nil, "b"}, {nil, 0, AvoidNodes(ctx, "c", "b", "a"), nil, "b"},
+			{[]string{"a", "b", "c"}, 0, AvoidNodes(ctx, "c", "b", "a"), nil, "c"}, {nil, 0, ctx, nil, "a"},
 		}},
-		{"avoid of every READY node keeps a penalty", []pick{
-			{nil, 0, ctx, unavailable, "a"}, {nil, 0, AvoidNodes(ctx, "a", "b", "c"), nil, "b"},
+		{"avoid of every READY node ignores penalties", []pick{
+			{nil, 0, ctx, unavailable, "a"}, {nil, 0, AvoidNodes(ctx, "a", "b", "c"), nil, "a"}, {nil, 0, ctx, nil, "b"},
+		}},
+		{"avoid skips a node that is not READY", []pick{
+			{[]string{"a", "b"}, 0, AvoidNodes(ctx, "c", "b"), nil, "a"}, {nil, 0, AvoidNodes(ctx, "c", "a"), nil, "b"},
+		}},
+		{"nested avoids add up", []pick{
+			{nil, 0, AvoidNodes(avoidA, "b"), nil, "c"}, {nil, 0, AvoidNodes(AvoidNodes(ctx, "c", "b"), "a", "c"), nil, "b"},
 		}},
 		{"failed avoiding call penalizes the node it used", []pick{
 			{nil, 0, avoidA, unavailable, "b"}, {nil, 0, avoidA, nil, "c"}, {nil, 0, ctx, nil, "a"},
@@ -341,6 +348,12 @@ func TestTrackNode(t *testing.T) {
 	if got := last(); got != "a" {
 		t.Errorf("TrackNode() after avoiding c = %q, want \"a\"", got)
 	}
+
+	inner, innerLast := TrackNode(ctx)
+	tb.pick(t, AvoidNodes(inner, "c", "a"))
+	if got, gotInner := last(), innerLast(); got != "b" || gotInner != "b" {
+		t.Errorf("nested TrackNode() after picking b = %q outer, %q inner, want \"b\" for both", got, gotInner)
+	}
 }
 
 func TestAvoidNodesKeepsState(t *testing.T) {
@@ -352,6 +365,7 @@ func TestAvoidNodesKeepsState(t *testing.T) {
 		{"first node", []string{"a"}, "b"},
 		{"two nodes", []string{"b", "a"}, "c"},
 		{"every node", []string{"a", "b", "c"}, "a"},
+		{"every node, newest first", []string{"c", "b", "a"}, "c"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

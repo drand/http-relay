@@ -40,12 +40,21 @@ var (
 	builtBalancers    = make(chan *fallbackBalancer, 1)
 )
 
-// streamNode is a drand node whose PublicRandStream fails with fail, or sends one beacon when fail is nil.
+// streamNode is a drand node whose PublicRandStream fails with fail, or sends one beacon when fail is nil. Its
+// PublicRand fails with randErr, or returns round 42 when randErr is nil.
 type streamNode struct {
 	proto.UnimplementedPublicServer
-	name   string
-	fail   func(proto.Public_PublicRandStreamServer) error
-	opened func(name string)
+	name    string
+	fail    func(proto.Public_PublicRandStreamServer) error
+	randErr error
+	opened  func(name string)
+}
+
+func (n *streamNode) PublicRand(context.Context, *proto.PublicRandRequest) (*proto.PublicRandResponse, error) {
+	if n.randErr != nil {
+		return nil, n.randErr
+	}
+	return &proto.PublicRandResponse{Round: 42}, nil
 }
 
 func (n *streamNode) ChainInfo(context.Context, *proto.ChainInfoRequest) (*proto.ChainInfoPacket, error) {
@@ -85,6 +94,16 @@ func downStream(proto.Public_PublicRandStreamServer) error {
 // the client, the balancer, and a function listing the nodes that opened a stream, in order.
 func serveNodes(t *testing.T, failing ...func(proto.Public_PublicRandStreamServer) error) (*Client, *fallbackBalancer, func() []string) {
 	t.Helper()
+	nodes := make([]*streamNode, len(failing))
+	for i, fail := range failing {
+		nodes[i] = &streamNode{fail: fail}
+	}
+	return serve(t, nodes...)
+}
+
+// serve serves nodes, named a, b, c and d in order, through a fallback balancer, like serveNodes.
+func serve(t *testing.T, nodes ...*streamNode) (*Client, *fallbackBalancer, func() []string) {
+	t.Helper()
 	registerRecording.Do(func() {
 		balancer.Register(recordingBuilder{NewFallbackBuilder(FallbackTimeout), builtBalancers})
 	})
@@ -97,12 +116,13 @@ func serveNodes(t *testing.T, failing ...func(proto.Public_PublicRandStreamServe
 		defer mu.Unlock()
 		opened = append(opened, name)
 	}
-	addrs := []string{"a", "b", "c", "d"}[:len(failing)]
+	addrs := []string{"a", "b", "c", "d"}[:len(nodes)]
 	listeners := map[string]*bufconn.Listener{}
 	for i, addr := range addrs {
+		nodes[i].name, nodes[i].opened = addr, record
 		lis := bufconn.Listen(1 << 16)
 		srv := grpc.NewServer()
-		proto.RegisterPublicServer(srv, &streamNode{name: addr, fail: failing[i], opened: record})
+		proto.RegisterPublicServer(srv, nodes[i])
 		go func() { _ = srv.Serve(lis) }()
 		t.Cleanup(srv.Stop)
 		listeners[addr] = lis
@@ -165,7 +185,7 @@ func TestStreamReopensOnNextNode(t *testing.T) {
 			c, fb, opened := serveNodes(t, append(tt.failing, nil)...)
 			addrs := []string{"a", "b", "c", "d"}[:len(tt.failing)+1]
 			ch := make(chan nextResult, 1)
-			s := &sharedStream{waiters: map[chan nextResult]struct{}{ch: {}}, running: true, failed: map[string]struct{}{}}
+			s := &sharedStream{waiters: map[chan nextResult]struct{}{ch: {}}, running: true}
 
 			done := make(chan struct{})
 			go func() {
@@ -214,6 +234,24 @@ func TestNextStreamErrorOnEveryNode(t *testing.T) {
 		ctx, served := TrackNode(context.Background())
 		if _, err := c.pc.ChainInfo(ctx, &proto.ChainInfoRequest{}); err != nil || served() != "a" {
 			t.Errorf("after Next() %d, ChainInfo() = %v on %q, want nil on a", i, err, served())
+		}
+	}
+}
+
+func TestGetBeaconRetriesOnAnotherNode(t *testing.T) {
+	c, fb, _ := serve(t, &streamNode{randErr: errors.New("beacon not found")}, &streamNode{})
+	for i := range 3 {
+		ctx, served := TrackNode(context.Background())
+		b, err := c.GetBeacon(ctx, byBeaconID, 42)
+		if err != nil || b.Round != 42 || served() != "b" {
+			t.Fatalf("GetBeacon() %d = %v, %v from %q, want round 42 from b", i, b, err, served())
+		}
+		if got := penalized(fb); len(got) != 0 {
+			t.Errorf("after GetBeacon() %d, penalized nodes = %v, want none", i, got)
+		}
+		ctx, served = TrackNode(context.Background())
+		if _, err := c.pc.PublicRand(ctx, &proto.PublicRandRequest{}); err == nil || served() != "a" {
+			t.Errorf("after GetBeacon() %d, PublicRand() = %v on %q, want an error from a", i, err, served())
 		}
 	}
 }

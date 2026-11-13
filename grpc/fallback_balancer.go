@@ -172,13 +172,19 @@ func (fb *fallbackBalancer) penalize(addr string, d time.Duration) {
 	fb.refresh(now)
 }
 
-// other returns the best-ranked READY node not in avoid, nil if there is none.
+// other returns the best-ranked READY node not in avoid, or else the READY node that comes first in avoid, nil if no
+// node is READY.
 func (fb *fallbackBalancer) other(avoid []string) *choice {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	for _, n := range rank(slices.Collect(maps.Values(fb.nodes)), fb.now()) {
 		if !slices.Contains(avoid, n.addr) {
 			return &choice{sc: n.sc, addr: n.addr}
+		}
+	}
+	for _, addr := range avoid {
+		if n, ok := fb.nodes[addr]; ok && n.sc != nil {
+			return &choice{sc: n.sc, addr: addr}
 		}
 	}
 	return nil
@@ -287,19 +293,31 @@ type (
 	trackKey struct{}
 )
 
-// AvoidNodes returns a context whose calls go to the best-ranked READY node not in addrs, or to the usual node when
-// every READY node is in addrs. It penalizes no node: a node that lags, or fails a single chain, keeps serving the
-// others.
+// AvoidNodes returns a context whose calls go to the best-ranked READY node not in addrs, ordered oldest failure first.
+// When every READY node is in addrs, they go to the one that comes first. The addrs add to the ones ctx already
+// avoids, as newer failures. It penalizes no node: a node that lags, or fails a single chain, keeps serving the others.
 func AvoidNodes(ctx context.Context, addrs ...string) context.Context {
-	return context.WithValue(ctx, avoidKey{}, slices.Clone(addrs))
+	prev, _ := ctx.Value(avoidKey{}).([]string)
+	avoid := slices.Clone(prev)
+	for _, addr := range addrs {
+		avoid = append(slices.DeleteFunc(avoid, func(a string) bool { return a == addr }), addr)
+	}
+	return context.WithValue(ctx, avoidKey{}, avoid)
+}
+
+type tracker struct {
+	last   atomic.Pointer[string]
+	parent *tracker
 }
 
 // TrackNode returns a context that records the node picked for its calls, and a function returning the address of the
-// last one picked, or "" if none was. It is safe for concurrent use.
+// last one picked, or "" if none was. Trackers nest: a pick is recorded by every TrackNode up the context chain. It is
+// safe for concurrent use.
 func TrackNode(ctx context.Context) (context.Context, func() string) {
-	var last atomic.Pointer[string]
-	return context.WithValue(ctx, trackKey{}, &last), func() string {
-		if addr := last.Load(); addr != nil {
+	t := &tracker{}
+	t.parent, _ = ctx.Value(trackKey{}).(*tracker)
+	return context.WithValue(ctx, trackKey{}, t), func() string {
+		if addr := t.last.Load(); addr != nil {
 			return *addr
 		}
 		return ""
@@ -318,8 +336,8 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 			c = o
 		}
 	}
-	if last, ok := info.Ctx.Value(trackKey{}).(*atomic.Pointer[string]); ok {
-		last.Store(&c.addr)
+	for t, _ := info.Ctx.Value(trackKey{}).(*tracker); t != nil; t = t.parent {
+		t.last.Store(&c.addr)
 	}
 
 	// The metric for a subchannel should be atomically incremented by one

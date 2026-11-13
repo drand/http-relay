@@ -150,11 +150,12 @@ func (c *Client) GetBeacon(ctx context.Context, m *proto.Metadata, round uint64)
 		Metadata: m,
 	}
 
+	ctx, served := TrackNode(ctx)
 	randResp, err := c.pc.PublicRand(ctx, in)
 	if err != nil {
 		c.log.Debug("GetBeacon failed once")
-		// we do 1 retry (automagically with the next subconn thanks to the fallback LB) if it failed
-		randResp, err = c.pc.PublicRand(ctx, in)
+		// the balancer only moves on by itself after transport failures, a node lagging behind returns plain errors
+		randResp, err = c.pc.PublicRand(AvoidNodes(ctx, served()), in)
 		if err != nil {
 			return nil, err
 		}
@@ -201,13 +202,14 @@ func (c *Client) Check(ctx context.Context) error {
 
 	client := healthgrpc.NewHealthClient(c.conn)
 
+	ctx, served := TrackNode(ctx)
 	tctx, cancel := context.WithTimeout(ctx, c.healthTimeout)
 	defer cancel()
 
 	resp, err := client.Check(tctx, &healthgrpc.HealthCheckRequest{})
 	if err != nil {
-		// we do 1 retry (automagically with the next subconn thanks to the fallback LB) if it failed
-		resp, err = client.Check(ctx, &healthgrpc.HealthCheckRequest{})
+		// the balancer only moves on by itself after transport failures
+		resp, err = client.Check(AvoidNodes(ctx, served()), &healthgrpc.HealthCheckRequest{})
 		if err != nil {
 			return err
 		}
