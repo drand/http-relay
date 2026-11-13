@@ -448,3 +448,71 @@ func TestNextHaltedChain(t *testing.T) {
 		<-results[0]
 	})
 }
+
+// TestNextHaltedChainRestarts checks that a halted chain is blamed once per node even when the stream stops between
+// stalls because its callers left.
+func TestNextHaltedChainRestarts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tb := newTestBalancer("a", "b", "c")
+		tb.now = time.Now
+		node := &balancedNode{tb: tb}
+		c := newClient(node, slog.New(slog.DiscardHandler))
+		defer c.cancel()
+		c.nodes = 3
+		stall := stallPeriods * fakePeriod * time.Second
+
+		// each caller leaves once the stream is open, so the stall stops the stream and the next caller restarts it
+		restart := func() {
+			results, cancels := callNext(c, []*proto.Metadata{byBeaconID})
+			time.Sleep(c.maxBackoff)
+			synctest.Wait()
+			cancels[0]()
+			<-results[0]
+			time.Sleep(stall)
+			synctest.Wait()
+		}
+		for range 6 {
+			restart()
+		}
+		// long enough for every penalty of the first walk to end
+		time.Sleep(2 * c.streamPenalty(stall))
+		restart()
+		picked := node.pickedNodes()
+		if len(picked) != 7 || !slices.Equal(picked[:3], []string{"a", "b", "c"}) {
+			t.Fatalf("streams opened on %v, want [a b c] then a", picked)
+		}
+		if i := slices.IndexFunc(picked[3:], func(addr string) bool { return addr != "a" }); i >= 0 {
+			t.Errorf("streams opened on %v after stalling on every node, want only a", picked[3:])
+		}
+		tb.mu.Lock()
+		for addr, n := range tb.nodes {
+			if time.Now().Before(n.penalizedUntil) {
+				t.Errorf("node %s penalized until %v after stalling on every node, want no penalty", addr, n.penalizedUntil)
+			}
+		}
+		tb.mu.Unlock()
+		if got, _ := tb.pick(t, context.Background()); got != "a" {
+			t.Errorf("Pick() after stalling on every node = %s, want a", got)
+		}
+
+		// a beacon arms the blame again, from the stream opened after it
+		results, _ := callNext(c, []*proto.Metadata{byBeaconID})
+		time.Sleep(c.maxBackoff)
+		synctest.Wait()
+		streams := node.opened()
+		streams[len(streams)-1].recv <- recvResult{resp: &proto.PublicRandResponse{Round: 42}}
+		if res := <-results[0]; res.err != nil {
+			t.Fatalf("Next() after the chain resumed = %v, %v, want a beacon", res.beacon, res.err)
+		}
+		results, _ = callNext(c, []*proto.Metadata{byBeaconID})
+		synctest.Wait()
+		before := len(node.pickedNodes())
+		time.Sleep(2*stall + c.maxBackoff)
+		synctest.Wait()
+		if got := node.pickedNodes()[before:]; !slices.Equal(got, []string{"a", "b"}) {
+			t.Errorf("stream opened on %v after a beacon and two stalls, want [a b]", got)
+		}
+		c.cancel()
+		<-results[0]
+	})
+}

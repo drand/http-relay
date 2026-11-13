@@ -186,12 +186,13 @@ func TestPickerFailover(t *testing.T) {
 		{"excused stall keeps the node", []pick{
 			{nil, 0, excused, status.Error(codes.Canceled, "stalled"), "a"}, {nil, 0, ctx, nil, "a"},
 		}},
-		{"avoid moves to the next node", []pick{{nil, 0, avoidA, nil, "b"}, {nil, 0, ctx, nil, "b"}}},
-		{"avoid twice keeps the next node", []pick{
-			{nil, 0, avoidA, nil, "b"}, {nil, 0, avoidA, nil, "b"}, {nil, 0, avoidA, nil, "b"}, {nil, 0, ctx, nil, "b"},
+		{"avoid picks the next node for that call only", []pick{{nil, 0, avoidA, nil, "b"}, {nil, 0, ctx, nil, "a"}}},
+		{"failed avoiding call penalizes the node it used", []pick{
+			{nil, 0, avoidA, unavailable, "b"}, {nil, 0, avoidA, nil, "c"}, {nil, 0, ctx, nil, "a"},
 		}},
-		{"concurrent avoids of a stale node keep the next node", []pick{
-			{[]string{"a", "b"}, 0, avoidA, nil, "b"}, {nil, time.Second, avoidA, nil, "b"}, {nil, 0, ctx, nil, "b"},
+		{"avoid with every other node penalized picks the best other", []pick{
+			{nil, 0, ctx, unavailable, "a"}, {nil, time.Second, ctx, unavailable, "b"},
+			{nil, time.Second, ctx, unavailable, "c"}, {nil, 0, ctx, nil, "a"}, {nil, 0, avoidA, nil, "b"},
 		}},
 		{"avoid of a penalized node keeps its penalty", []pick{
 			{nil, 0, ctx, unavailable, "a"}, {nil, 30 * time.Second, avoidA, nil, "b"}, {nil, 30 * time.Second, ctx, nil, "a"},
@@ -359,7 +360,7 @@ func TestZeroAddresses(t *testing.T) {
 }
 
 func TestTrackNode(t *testing.T) {
-	tb := newTestBalancer("a", "b")
+	tb := newTestBalancer("a", "b", "c")
 	ctx, last := TrackNode(context.Background())
 	if got := last(); got != "" {
 		t.Errorf("TrackNode() before any pick = %q, want \"\"", got)
@@ -370,6 +371,31 @@ func TestTrackNode(t *testing.T) {
 		if got := last(); got != want {
 			t.Errorf("TrackNode() after picking %s = %q, want %q", want, got, want)
 		}
+	}
+	// c is now first
+	tb.pick(t, AvoidNode(ctx, "c"))
+	if got := last(); got != "a" {
+		t.Errorf("TrackNode() after avoiding c = %q, want \"a\"", got)
+	}
+}
+
+func TestAvoidNodeKeepsState(t *testing.T) {
+	tb := newTestBalancer("a", "b", "c")
+	for range 100 {
+		tb.clock = tb.clock.Add(time.Second)
+		if got, done := tb.pick(t, AvoidNode(context.Background(), "a")); got != "b" {
+			t.Fatalf("Pick(AvoidNode(a)) = %s, want b", got)
+		} else {
+			done(nil)
+		}
+	}
+	for addr, n := range tb.nodes {
+		if !n.penalizedUntil.IsZero() {
+			t.Errorf("node %s penalized until %v after avoids, want no penalty", addr, n.penalizedUntil)
+		}
+	}
+	if got, _ := tb.pick(t, context.Background()); got != "a" {
+		t.Errorf("Pick() after avoids of a = %s, want a", got)
 	}
 }
 

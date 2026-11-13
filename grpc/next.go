@@ -34,6 +34,7 @@ type sharedStream struct {
 	waiters  map[chan nextResult]struct{}
 	running  bool
 	failures uint      // consecutive stream failures, reset when a beacon arrives
+	stalls   int       // stalls since the last beacon, kept across restarts so that a halt is not blamed again
 	retryAt  time.Time // earliest time to reopen the stream
 }
 
@@ -88,12 +89,10 @@ func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error
 // remaining waiters. A stalled stream is reopened as long as it has waiters, which keep waiting. The next call to
 // Next starts it again.
 func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Duration) {
-	// errors other than stalls, and stalls, since the last beacon
-	errs, stalls := 0, 0
+	// errors other than stalls since the last beacon
+	errs := 0
 	for {
-		// A stall on every node means the chain halted network-wide: blaming nodes for it would keep them all
-		// penalized and rotate the traffic of every chain. A node that stays stuck is then kept until a beacon arrives.
-		err := c.receive(s, m, stall, stalls < c.nodes)
+		err := c.receive(s, m, stall)
 		if c.ctx.Err() != nil {
 			err = errClientClosed
 		} else {
@@ -105,14 +104,14 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 		s.retryAt = time.Now().Add(c.backoff(s.failures))
 		if s.failures == 1 {
 			// a beacon arrived since the previous failure
-			errs, stalls = 0, 0
+			errs = 0
 		}
 		if errors.Is(err, errStreamStalled) {
-			stalls++
+			s.stalls++
 		} else {
 			errs++
 		}
-		// the picker reopens the stream on another node
+		// the picker reopens the stream on another node if it penalized this one
 		if len(s.waiters) > 0 && c.ctx.Err() == nil && errs < c.nodes {
 			c.nextMu.Unlock()
 			continue
@@ -127,10 +126,13 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 	}
 }
 
-// receive serves the waiters of s from one stream until it fails. A stall penalizes the node only when blameStall.
-func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration, blameStall bool) error {
+// receive serves the waiters of s from one stream until it fails.
+func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration) error {
 	c.nextMu.Lock()
 	wait := time.Until(s.retryAt)
+	// A stall on every node means the chain halted network-wide: blaming nodes for it would keep them all penalized
+	// and rotate the traffic of every chain. A node that stays stuck is then kept until a beacon arrives.
+	blameStall := s.stalls < c.nodes
 	c.nextMu.Unlock()
 	if wait > 0 {
 		select {
@@ -166,7 +168,7 @@ func (c *Client) receive(s *sharedStream, m *proto.Metadata, stall time.Duration
 		}
 
 		c.nextMu.Lock()
-		s.failures = 0
+		s.failures, s.stalls = 0, 0
 		for ch := range s.waiters {
 			// handlers mutate the beacon they get, so each waiter needs its own
 			ch <- nextResult{beacon: NewHexBeacon(resp)}

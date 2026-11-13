@@ -72,7 +72,7 @@ func (f fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) b
 type fallbackBalancer struct {
 	// Embeds balancer.Balancer because needs to intercept UpdateClientConnState to learn state.
 	balancer.Balancer
-	// timeout is how long a node stays behind the others after failing a unary call or being skipped.
+	// timeout is how long a node stays behind the others after failing a unary call.
 	timeout time.Duration
 	now     func() time.Time
 
@@ -164,28 +164,25 @@ func (fb *fallbackBalancer) penalize(addr string, d time.Duration) {
 		// the resolver removed it
 		return
 	}
-	fb.penalizeLocked(n, fb.now(), d)
-}
-
-// avoid penalizes the node at addr for fb.timeout unless it already is penalized, so that every pick asking to avoid
-// the same node demotes it once.
-func (fb *fallbackBalancer) avoid(addr string) {
-	fb.mu.Lock()
-	defer fb.mu.Unlock()
-	n, ok := fb.nodes[addr]
-	if now := fb.now(); ok && !now.Before(n.penalizedUntil) {
-		fb.penalizeLocked(n, now, fb.timeout)
-	}
-}
-
-// penalizeLocked penalizes n from now for at least d. fb.mu must be held.
-func (fb *fallbackBalancer) penalizeLocked(n *node, now time.Time, d time.Duration) {
-	fbLog.Warning("penalizing node", "addr", n.addr, "for", d)
+	fbLog.Warning("penalizing node", "addr", addr, "for", d)
+	now := fb.now()
 	n.failedAt = now
 	if until := now.Add(d); until.After(n.penalizedUntil) {
 		n.penalizedUntil = until
 	}
 	fb.refresh(now)
+}
+
+// other returns the best-ranked READY node other than addr, nil if there is none.
+func (fb *fallbackBalancer) other(addr string) *choice {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	for _, n := range rank(slices.Collect(maps.Values(fb.nodes)), fb.now()) {
+		if n.addr != addr {
+			return &choice{sc: n.sc, addr: n.addr}
+		}
+	}
+	return nil
 }
 
 // UpdateClientConnState keeps one node per address before the base balancer creates their SubConns.
@@ -296,8 +293,8 @@ type (
 	excusedStallKey struct{}
 )
 
-// AvoidNode returns a context whose calls go to another node than addr when one is READY: addr is penalized unless it
-// already is.
+// AvoidNode returns a context whose calls go to the best-ranked READY node other than addr, or to the usual node when
+// no other is READY. It penalizes no node: a node that answers but lags is not demoted by /health.
 func AvoidNode(ctx context.Context, addr string) context.Context {
 	return context.WithValue(ctx, avoidKey{}, addr)
 }
@@ -316,13 +313,15 @@ func TrackNode(ctx context.Context) (context.Context, func() string) {
 
 func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	fb := p.fb
-	if addr, ok := info.Ctx.Value(avoidKey{}).(string); ok {
-		fb.avoid(addr)
-	}
 	c := fb.choose()
 	if c == nil {
 		fbLog.Error("Pick had no available SubConn")
 		return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
+	}
+	if avoid, ok := info.Ctx.Value(avoidKey{}).(string); ok && avoid == c.addr {
+		if o := fb.other(avoid); o != nil {
+			c = o
+		}
 	}
 	if last, ok := info.Ctx.Value(trackKey{}).(*atomic.Pointer[string]); ok {
 		last.Store(&c.addr)
