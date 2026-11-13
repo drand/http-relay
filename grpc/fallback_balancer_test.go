@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -142,7 +143,9 @@ func TestPickerFailover(t *testing.T) {
 	stall(errStreamStalled)
 	cancelled, cancel := context.WithCancel(stream)
 	cancel()
-	skip := context.WithValue(ctx, SkipCtxKey{}, true)
+	excused, stallExcused := context.WithCancelCause(context.WithValue(stream, excusedStallKey{}, true))
+	stallExcused(errStreamStalled)
+	avoidA, avoidB := AvoidNode(ctx, "a"), AvoidNode(ctx, "b")
 	unavailable := status.Error(codes.Unavailable, "node down")
 	// drand nodes return plain errors, which reach the client as codes.Unknown
 	unknownRound := status.Error(codes.Unknown, "can't retrieve beacon 7")
@@ -180,8 +183,24 @@ func TestPickerFailover(t *testing.T) {
 			{[]string{"a", "b"}, 0, long, unavailable, "a"}, {nil, time.Second, ctx, unavailable, "b"},
 			{nil, time.Second, ctx, unavailable, "a"}, {nil, 2 * time.Minute, ctx, nil, "b"},
 		}},
-		{"skip moves to the next node", []pick{{nil, 0, skip, nil, "b"}, {nil, 0, ctx, nil, "b"}}},
-		{"skip with one READY node keeps it", []pick{{[]string{"a"}, 0, skip, nil, "a"}, {nil, 0, ctx, nil, "a"}}},
+		{"excused stall keeps the node", []pick{
+			{nil, 0, excused, status.Error(codes.Canceled, "stalled"), "a"}, {nil, 0, ctx, nil, "a"},
+		}},
+		{"avoid moves to the next node", []pick{{nil, 0, avoidA, nil, "b"}, {nil, 0, ctx, nil, "b"}}},
+		{"avoid twice keeps the next node", []pick{
+			{nil, 0, avoidA, nil, "b"}, {nil, 0, avoidA, nil, "b"}, {nil, 0, avoidA, nil, "b"}, {nil, 0, ctx, nil, "b"},
+		}},
+		{"concurrent avoids of a stale node keep the next node", []pick{
+			{[]string{"a", "b"}, 0, avoidA, nil, "b"}, {nil, time.Second, avoidA, nil, "b"}, {nil, 0, ctx, nil, "b"},
+		}},
+		{"avoid of a penalized node keeps its penalty", []pick{
+			{nil, 0, ctx, unavailable, "a"}, {nil, 30 * time.Second, avoidA, nil, "b"}, {nil, 30 * time.Second, ctx, nil, "a"},
+		}},
+		{"avoid of another node keeps the first node", []pick{{nil, 0, avoidB, nil, "a"}, {nil, 0, ctx, nil, "a"}}},
+		{"avoid of an unknown node keeps the first node", []pick{
+			{nil, 0, AvoidNode(ctx, ""), nil, "a"}, {nil, 0, AvoidNode(ctx, "x"), nil, "a"},
+		}},
+		{"avoid with one READY node keeps it", []pick{{[]string{"a"}, 0, avoidA, nil, "a"}, {nil, 0, ctx, nil, "a"}}},
 		{"late READY node before penalized ones", []pick{
 			{[]string{"a"}, 0, ctx, unavailable, "a"}, {[]string{"a", "b"}, time.Second, ctx, nil, "b"},
 			{[]string{"a", "b", "c"}, time.Second, ctx, unavailable, "b"}, {nil, time.Second, ctx, nil, "c"},
@@ -336,5 +355,86 @@ func TestZeroAddresses(t *testing.T) {
 	}
 	if c := fb.current.Load(); c != nil {
 		t.Errorf("choice without addresses = %s, want none", c.addr)
+	}
+}
+
+func TestTrackNode(t *testing.T) {
+	tb := newTestBalancer("a", "b")
+	ctx, last := TrackNode(context.Background())
+	if got := last(); got != "" {
+		t.Errorf("TrackNode() before any pick = %q, want \"\"", got)
+	}
+	for _, want := range []string{"a", "b"} {
+		_, done := tb.pick(t, ctx)
+		done(status.Error(codes.Unavailable, "node down"))
+		if got := last(); got != want {
+			t.Errorf("TrackNode() after picking %s = %q, want %q", want, got, want)
+		}
+	}
+}
+
+// TestBalancerConcurrency lets the race detector check picks, penalties, readiness and address changes together.
+func TestBalancerConcurrency(t *testing.T) {
+	tb := newTestBalancer("a", "b", "c")
+	tb.now = time.Now
+	p := &picker{fb: tb.fallbackBalancer}
+	ctxs := []context.Context{
+		context.Background(),
+		AvoidNode(context.Background(), "a"),
+		context.WithValue(context.Background(), streamPenaltyKey{}, time.Millisecond),
+	}
+	readySets := [][]string{{"a", "b", "c"}, {"b"}, {}, {"a", "c"}}
+	addrSets := [][]resolver.Address{resolved("a", "b", "c"), resolved("c", "a"), resolved("b")}
+	const iterations = 500
+
+	var wg sync.WaitGroup
+	for _, ctx := range ctxs {
+		wg.Go(func() {
+			for range iterations {
+				res, err := p.Pick(balancer.PickInfo{Ctx: ctx})
+				if err != nil {
+					continue
+				}
+				if addr := res.Metadata["target"][0]; res.SubConn != tb.scs[addr] {
+					t.Errorf("Pick() = SubConn %p, target %s, want SubConn %p", res.SubConn, addr, tb.scs[addr])
+				}
+				res.Done(balancer.DoneInfo{Err: status.Error(codes.Unavailable, "node down")})
+			}
+		})
+	}
+	wg.Go(func() {
+		for i := range iterations {
+			tb.ready(readySets[i%len(readySets)]...)
+		}
+	})
+	wg.Go(func() {
+		for i := range iterations {
+			tb.setAddresses(addrSets[i%len(addrSets)])
+		}
+	})
+	wg.Wait()
+}
+
+func TestNodeFault(t *testing.T) {
+	ctx := context.Background()
+	internal := status.Error(codes.Internal, "grpc: error while marshaling")
+	tests := []struct {
+		name   string
+		di     balancer.DoneInfo
+		stream bool
+		want   bool
+	}{
+		{"success", balancer.DoneInfo{BytesSent: true, BytesReceived: true}, false, false},
+		{"internal from the node", balancer.DoneInfo{Err: internal, BytesSent: true, BytesReceived: true}, false, true},
+		{"internal from the client", balancer.DoneInfo{Err: internal, BytesSent: true}, false, false},
+		{"internal from the client on a stream", balancer.DoneInfo{Err: internal, BytesSent: true}, true, true},
+		{"unavailable before any byte", balancer.DoneInfo{Err: status.Error(codes.Unavailable, "node down")}, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nodeFault(ctx, tt.di, tt.stream); got != tt.want {
+				t.Errorf("nodeFault(%+v, stream %v) = %v, want %v", tt.di, tt.stream, got, tt.want)
+			}
+		})
 	}
 }

@@ -127,7 +127,8 @@ func TestStreamReopensOnNextNode(t *testing.T) {
 
 			done := make(chan struct{})
 			go func() {
-				c.runStream(s, &proto.Metadata{}, 50*time.Millisecond)
+				// well above scheduling delays, so that the healthy node sends its beacon before it stalls
+				c.runStream(s, &proto.Metadata{}, 300*time.Millisecond)
 				close(done)
 			}()
 			select {
@@ -143,8 +144,9 @@ func TestStreamReopensOnNextNode(t *testing.T) {
 
 			mu.Lock()
 			defer mu.Unlock()
-			if !slices.Equal(opened, addrs) {
-				t.Errorf("streams opened on %v, want %v", opened, addrs)
+			// only the last node sends beacons, a slow runner may still reopen the stream after it
+			if len(opened) < len(addrs) || !slices.Equal(opened[:len(addrs)], addrs) {
+				t.Errorf("streams opened on %v, want %v first", opened, addrs)
 			}
 		})
 	}

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -10,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/drand/drand/v2/common"
 	proto "github.com/drand/drand/v2/protobuf/drand"
@@ -216,7 +216,8 @@ func GetHealth(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 			return
 		}
 
-		latest, err := c.GetBeacon(r.Context(), m, 0)
+		ctx, served := grpc.TrackNode(r.Context())
+		latest, err := c.GetBeacon(ctx, m, 0)
 		if err != nil {
 			slog.Error("[GetHealth] failed to get latest beacon", "error", err)
 			http.Error(w, "Failed to get latest beacon for health", http.StatusInternalServerError)
@@ -234,8 +235,7 @@ func GetHealth(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 		if next-2 > latest.Round {
 			// we force a retry with another backend if we see a discrepancy in case that backend is stuck on a old latest beacon
 			slog.Debug("[GetHealth] forcing retry with other SubConn")
-			ctx := context.WithValue(r.Context(), grpc.SkipCtxKey{}, true)
-			latest, err = c.GetBeacon(ctx, m, 0)
+			latest, err = c.GetBeacon(grpc.AvoidNode(r.Context(), served()), m, 0)
 			if err != nil {
 				slog.Error("[GetHealth] failed to get latest beacon", "error", err)
 				http.Error(w, "Failed to get latest beacon for health", http.StatusInternalServerError)
@@ -354,6 +354,10 @@ func createRequestMD(r *http.Request) (*proto.Metadata, error) {
 
 	// handling the beacon ID case
 	if beaconID != "" && chainhash == "" {
+		// proto3 strings must be valid UTF-8, the gRPC call would fail before reaching any node
+		if !utf8.ValidString(beaconID) {
+			return nil, errors.New("beacon ID is not valid UTF-8")
+		}
 		// clients sometimes hit /beacons/ with a chain hash; beacon IDs are never 64 hex chars
 		if len(beaconID) != 64 {
 			return &proto.Metadata{BeaconID: beaconID}, nil

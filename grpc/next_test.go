@@ -12,6 +12,8 @@ import (
 
 	proto "github.com/drand/drand/v2/protobuf/drand"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/status"
 )
 
 const fakePeriod = 3
@@ -347,5 +349,102 @@ func TestNextClosedClient(t *testing.T) {
 		if b, err := c.Next(context.Background(), byBeaconID); !errors.Is(err, errClientClosed) {
 			t.Errorf("Next() after close = %v, %v, want error %v", b, err, errClientClosed)
 		}
+	})
+}
+
+// balancedNode opens its streams on the node the picker of tb chooses, and reports to the picker how they ended.
+type balancedNode struct {
+	fakeNode
+	tb     *testBalancer
+	picked []string // guarded by fakeNode.mu
+}
+
+func (n *balancedNode) PublicRandStream(ctx context.Context, in *proto.PublicRandRequest, opts ...grpc.CallOption) (proto.Public_PublicRandStreamClient, error) {
+	res, err := (&picker{fb: n.tb.fallbackBalancer}).Pick(balancer.PickInfo{Ctx: ctx})
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		<-ctx.Done()
+		res.Done(balancer.DoneInfo{Err: status.FromContextError(ctx.Err()).Err()})
+	}()
+	n.mu.Lock()
+	n.picked = append(n.picked, res.Metadata["target"][0])
+	n.mu.Unlock()
+	return n.fakeNode.PublicRandStream(ctx, in, opts...)
+}
+
+func (n *balancedNode) pickedNodes() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.picked)
+}
+
+func TestNextHaltedChain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tb := newTestBalancer("a", "b", "c")
+		tb.now = time.Now
+		node := &balancedNode{tb: tb}
+		c := newClient(node, slog.New(slog.DiscardHandler))
+		defer c.cancel()
+		c.nodes = 3
+		stall := stallPeriods * fakePeriod * time.Second
+
+		results, _ := callNext(c, []*proto.Metadata{byBeaconID})
+		// long enough for every penalty of the first walk to end
+		time.Sleep(2 * c.streamPenalty(stall))
+		synctest.Wait()
+		select {
+		case res := <-results[0]:
+			t.Fatalf("Next() on a halted chain = %v, %v, want it to keep waiting", res.beacon, res.err)
+		default:
+		}
+		picked := node.pickedNodes()
+		if !slices.Equal(picked[:3], []string{"a", "b", "c"}) {
+			t.Fatalf("stream opened first on %v, want [a b c]", picked[:3])
+		}
+		if i := slices.IndexFunc(picked[3:], func(addr string) bool { return addr != "a" }); i >= 0 {
+			t.Errorf("stream opened on %v after stalling on every node, want only a", picked[3:])
+		}
+		tb.mu.Lock()
+		for addr, n := range tb.nodes {
+			if time.Now().Before(n.penalizedUntil) {
+				t.Errorf("node %s penalized until %v after stalling on every node, want no penalty", addr, n.penalizedUntil)
+			}
+		}
+		tb.mu.Unlock()
+		for range 3 {
+			if got, done := tb.pick(t, context.Background()); got != "a" {
+				t.Fatalf("Pick() after stalling on every node = %s, want a", got)
+			} else {
+				done(nil)
+			}
+			time.Sleep(stall)
+			synctest.Wait()
+		}
+
+		// a beacon arms the blame again, from the stream opened after it
+		for streams := node.opened(); streams[len(streams)-1].ctx.Err() != nil; streams = node.opened() {
+			time.Sleep(time.Second)
+			synctest.Wait()
+		}
+		streams := node.opened()
+		streams[len(streams)-1].recv <- recvResult{resp: &proto.PublicRandResponse{Round: 42}}
+		if res := <-results[0]; res.err != nil {
+			t.Fatalf("Next() after the chain resumed = %v, %v, want a beacon", res.beacon, res.err)
+		}
+		results, _ = callNext(c, []*proto.Metadata{byBeaconID})
+		synctest.Wait()
+		before := len(node.pickedNodes())
+		time.Sleep(2*stall + c.maxBackoff)
+		synctest.Wait()
+		if got := node.pickedNodes()[before:]; !slices.Equal(got, []string{"a", "b"}) {
+			t.Errorf("stream opened on %v after a beacon and two stalls, want [a b]", got)
+		}
+		if got, _ := tb.pick(t, context.Background()); got != "b" {
+			t.Errorf("Pick() after a stall following a beacon = %s, want b", got)
+		}
+		c.cancel()
+		<-results[0]
 	})
 }

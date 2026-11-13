@@ -164,8 +164,23 @@ func (fb *fallbackBalancer) penalize(addr string, d time.Duration) {
 		// the resolver removed it
 		return
 	}
-	now := fb.now()
-	fbLog.Warning("penalizing node", "addr", addr, "for", d)
+	fb.penalizeLocked(n, fb.now(), d)
+}
+
+// avoid penalizes the node at addr for fb.timeout unless it already is penalized, so that every pick asking to avoid
+// the same node demotes it once.
+func (fb *fallbackBalancer) avoid(addr string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	n, ok := fb.nodes[addr]
+	if now := fb.now(); ok && !now.Before(n.penalizedUntil) {
+		fb.penalizeLocked(n, now, fb.timeout)
+	}
+}
+
+// penalizeLocked penalizes n from now for at least d. fb.mu must be held.
+func (fb *fallbackBalancer) penalizeLocked(n *node, now time.Time, d time.Duration) {
+	fbLog.Warning("penalizing node", "addr", n.addr, "for", d)
 	n.failedAt = now
 	if until := now.Add(d); until.After(n.penalizedUntil) {
 		n.penalizedUntil = until
@@ -271,24 +286,46 @@ func (p *picker) String() string {
 	return "no READY node"
 }
 
-// SkipCtxKey, set to true in a call's context, penalizes the node the call would have used and picks the next one.
-type SkipCtxKey struct{}
+type (
+	avoidKey struct{}
+	trackKey struct{}
+	// streamPenaltyKey marks a call whose every failure is the node's fault. Its time.Duration value is how long the
+	// node stays behind the others, which must outlast the time the caller takes to retry.
+	streamPenaltyKey struct{}
+	// excusedStallKey marks a stream whose stall is not the node's fault.
+	excusedStallKey struct{}
+)
 
-// streamPenaltyKey marks a call whose every failure is the node's fault. Its time.Duration value is how long the
-// node stays behind the others, which must outlast the time the caller takes to retry.
-type streamPenaltyKey struct{}
+// AvoidNode returns a context whose calls go to another node than addr when one is READY: addr is penalized unless it
+// already is.
+func AvoidNode(ctx context.Context, addr string) context.Context {
+	return context.WithValue(ctx, avoidKey{}, addr)
+}
+
+// TrackNode returns a context that records the node picked for its calls, and a function returning the address of the
+// last one picked, or "" if none was. It is safe for concurrent use.
+func TrackNode(ctx context.Context) (context.Context, func() string) {
+	var last atomic.Pointer[string]
+	return context.WithValue(ctx, trackKey{}, &last), func() string {
+		if addr := last.Load(); addr != nil {
+			return *addr
+		}
+		return ""
+	}
+}
 
 func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	fb := p.fb
-	if skip, _ := info.Ctx.Value(SkipCtxKey{}).(bool); skip {
-		if c := fb.choose(); c != nil {
-			fb.penalize(c.addr, fb.timeout)
-		}
+	if addr, ok := info.Ctx.Value(avoidKey{}).(string); ok {
+		fb.avoid(addr)
 	}
 	c := fb.choose()
 	if c == nil {
 		fbLog.Error("Pick had no available SubConn")
 		return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
+	}
+	if last, ok := info.Ctx.Value(trackKey{}).(*atomic.Pointer[string]); ok {
+		last.Store(&c.addr)
 	}
 	penalty, stream := info.Ctx.Value(streamPenaltyKey{}).(time.Duration)
 	if !stream {
@@ -302,7 +339,7 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{
 		SubConn: c.sc,
 		Done: func(di balancer.DoneInfo) {
-			if nodeFault(info.Ctx, di.Err, stream) {
+			if nodeFault(info.Ctx, di, stream) {
 				fb.penalize(c.addr, penalty)
 			}
 		},
@@ -311,22 +348,28 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 }
 
 // nodeFault reports whether err means the node failed the call, rather than the caller giving up or asking for
-// something no node can serve. A stream we cancelled because the node stopped emitting beacons is the node's fault.
+// something no node can serve. A stream we cancelled because the node stopped emitting beacons is the node's fault,
+// unless the stall is excused.
 // drand nodes report unknown chains and rounds as codes.Unknown, so outside of a stream only transport-level codes
-// count.
-func nodeFault(ctx context.Context, err error, stream bool) bool {
+// count. The client reports its own failures, such as a request it cannot marshal, as codes.Internal before receiving
+// anything from the node.
+func nodeFault(ctx context.Context, di balancer.DoneInfo, stream bool) bool {
+	err := di.Err
 	if err == nil {
 		return false
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
-		return errors.Is(context.Cause(ctx), errStreamStalled)
+		excused, _ := ctx.Value(excusedStallKey{}).(bool)
+		return stream && !excused && errors.Is(context.Cause(ctx), errStreamStalled)
 	}
 	if stream {
 		return true
 	}
 	switch status.Code(err) {
-	case codes.Unavailable, codes.DeadlineExceeded, codes.Internal, codes.ResourceExhausted, codes.Unimplemented:
+	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted, codes.Unimplemented:
 		return true
+	case codes.Internal:
+		return di.BytesReceived
 	}
 	return false
 }
