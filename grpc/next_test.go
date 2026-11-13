@@ -317,8 +317,9 @@ func TestNextStreamErrorOnEveryNodeWaitsOneBackoff(t *testing.T) {
 			if b, err := c.Next(context.Background(), byBeaconID); !errors.Is(err, errStream) {
 				t.Fatalf("Next() %d = %v, %v, want error %v", i, b, err, errStream)
 			}
-			if elapsed := time.Since(start); elapsed > c.maxBackoff {
-				t.Errorf("Next() %d returned after %v, want at most %v", i, elapsed, c.maxBackoff)
+			// one backoff before the first node, the minimum between nodes
+			if elapsed, limit := time.Since(start), c.maxBackoff+2*c.minBackoff; elapsed > limit {
+				t.Errorf("Next() %d returned after %v, want at most %v", i, elapsed, limit)
 			}
 			if got, want := node.pickedNodes()[before:], []string{"a", "b", "c"}; !slices.Equal(got, want) {
 				t.Errorf("Next() %d opened streams on %v, want %v", i, got, want)
@@ -328,7 +329,9 @@ func TestNextStreamErrorOnEveryNodeWaitsOneBackoff(t *testing.T) {
 	})
 }
 
-func TestNextNoNodeToPick(t *testing.T) {
+// TestNextFailsWithoutPickedNode checks that an error with no node picked, as the balancer reports when every node is
+// down, fails the callers without retrying.
+func TestNextFailsWithoutPickedNode(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		tb := newTestBalancer("a", "b", "c")
 		tb.ready()
@@ -653,4 +656,37 @@ func TestNextStuckAfterBreak(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestNextHaltErrorsApart checks that stream errors separated by a stall do not add up and fail the callers of a
+// halted chain.
+func TestNextHaltErrorsApart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tb := newTestBalancer("a", "b")
+		tb.now = time.Now
+		node := &balancedNode{tb: tb}
+		c := newClient(node, slog.New(slog.DiscardHandler))
+		defer c.cancel()
+		c.nodes = 2
+		stall := stallPeriods * fakePeriod * time.Second
+		latest := func() *fakeStream {
+			streams := node.opened()
+			return streams[len(streams)-1]
+		}
+
+		results, _ := callNext(c, []*proto.Metadata{byBeaconID})
+		synctest.Wait()
+		latest().recv <- recvResult{err: errors.New("node restarted")}
+		// the next node stalls, then the stream reopens
+		time.Sleep(stall + c.maxBackoff)
+		synctest.Wait()
+		latest().recv <- recvResult{err: errors.New("node restarted")}
+		time.Sleep(c.maxBackoff)
+		synctest.Wait()
+		latest().recv <- recvResult{resp: &proto.PublicRandResponse{Round: 7}}
+		if res := <-results[0]; res.err != nil || res.beacon.Round != 7 {
+			t.Errorf("Next() = %v, %v, want round 7", res.beacon, res.err)
+		}
+		checkNoPenalty(t, tb)
+	})
 }

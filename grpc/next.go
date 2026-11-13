@@ -93,11 +93,11 @@ func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error
 // node that has not failed since the last beacon, or else to the one that failed longest ago, so a halted chain walks
 // the nodes round after round. The next call to Next starts it again, still avoiding those nodes.
 //
-// A reopen waits for the backoff only when it cannot go to a node not yet tried since the last beacon, so the callers
-// of a chain failing on every node get their error after one backoff at most. The stream fails its callers at once
-// when no node could be picked.
+// A reopen waits for the full backoff only when it cannot go to a node not yet tried since the last beacon, so the
+// callers of a chain failing on every node do not wait one backoff per node. The stream fails its callers at once when
+// no node could be picked.
 func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Duration) {
-	// errors other than stalls, and nodes tried, since the last beacon
+	// consecutive errors other than stalls, and nodes tried since the last beacon
 	errs := 0
 	tried := make(map[string]bool)
 	for {
@@ -117,7 +117,10 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 			clear(tried)
 		}
 		stalled := errors.Is(err, errStreamStalled)
-		if !stalled {
+		if stalled {
+			// a halt can last for hours: unrelated errors that far apart must not add up and fail the callers
+			errs = 0
+		} else {
 			errs++
 		}
 		if addr != "" {
@@ -125,9 +128,10 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 		}
 		if len(s.waiters) > 0 && c.ctx.Err() == nil && errs < c.nodes && (addr != "" || stalled) {
 			if addr != "" && !tried[addr] {
-				// the picker reopens on another node, at most once per node until a beacon arrives
+				// The picker reopens on another node, at most once per node until a beacon arrives. With a single
+				// READY node it reopens on the same one: the node must first see the previous stream end.
 				tried[addr] = true
-				s.retryAt = time.Time{}
+				s.retryAt = time.Now().Add(c.minBackoff)
 			}
 			c.nextMu.Unlock()
 			continue
