@@ -483,3 +483,41 @@ func TestNextStuckNodeRestarts(t *testing.T) {
 		checkNoPenalty(t, tb)
 	})
 }
+
+// TestNextCallersLeaveBeforeStall checks that a stuck node is skipped by the next start of the stream even when no
+// caller waited for its stall.
+func TestNextCallersLeaveBeforeStall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tb := newTestBalancer("a", "b", "c")
+		tb.now = time.Now
+		node := &balancedNode{tb: tb}
+		c := newClient(node, slog.New(slog.DiscardHandler))
+		defer c.cancel()
+		c.nodes = 3
+		stall := stallPeriods * fakePeriod * time.Second
+
+		results, cancels := callNext(c, []*proto.Metadata{byBeaconID})
+		synctest.Wait()
+		cancels[0]()
+		if res := <-results[0]; !errors.Is(res.err, context.Canceled) {
+			t.Fatalf("cancelled Next() = %v, %v, want error %v", res.beacon, res.err, context.Canceled)
+		}
+		time.Sleep(stall + c.maxBackoff)
+		synctest.Wait()
+		if got := node.pickedNodes(); !slices.Equal(got, []string{"a"}) {
+			t.Fatalf("stream opened on %v before the second caller, want [a]", got)
+		}
+
+		results, _ = callNext(c, []*proto.Metadata{byBeaconID})
+		synctest.Wait()
+		if got := node.pickedNodes(); !slices.Equal(got, []string{"a", "b"}) {
+			t.Fatalf("stream opened on %v for the second caller, want [a b]", got)
+		}
+		streams := node.opened()
+		streams[len(streams)-1].recv <- recvResult{resp: &proto.PublicRandResponse{Round: 42}}
+		if res := <-results[0]; res.err != nil || res.beacon.Round != 42 {
+			t.Errorf("Next() after a stall without callers = %v, %v, want round 42", res.beacon, res.err)
+		}
+		checkNoPenalty(t, tb)
+	})
+}

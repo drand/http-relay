@@ -92,7 +92,7 @@ func (c *Client) Next(ctx context.Context, m *proto.Metadata) (*HexBeacon, error
 // runStream serves the waiters of s until the stream failed on every node or the Client is closed, then fails the
 // remaining waiters. A stalled stream is reopened as long as it has waiters, which keep waiting. Each reopen goes to a
 // node that has not failed since the last beacon, so a halted chain walks the nodes round after round. The next call
-// to Next starts it again.
+// to Next starts it again, still avoiding those nodes.
 func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Duration) {
 	// errors other than stalls since the last beacon
 	errs := 0
@@ -129,7 +129,6 @@ func (c *Client) runStream(s *sharedStream, m *proto.Metadata, stall time.Durati
 			continue
 		}
 		s.running = false
-		clear(s.failed)
 		for ch := range s.waiters {
 			ch <- nextResult{err: err}
 			delete(s.waiters, ch)
