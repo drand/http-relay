@@ -235,7 +235,7 @@ func GetHealth(c *grpc.Client) func(http.ResponseWriter, *http.Request) {
 		if next-2 > latest.Round {
 			// we force a retry with another backend if we see a discrepancy in case that backend is stuck on a old latest beacon
 			slog.Debug("[GetHealth] forcing retry with other SubConn")
-			latest, err = c.GetBeacon(grpc.AvoidNode(r.Context(), served()), m, 0)
+			latest, err = c.GetBeacon(grpc.AvoidNodes(r.Context(), served()), m, 0)
 			if err != nil {
 				slog.Error("[GetHealth] failed to get latest beacon", "error", err)
 				http.Error(w, "Failed to get latest beacon for health", http.StatusInternalServerError)

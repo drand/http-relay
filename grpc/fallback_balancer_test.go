@@ -137,15 +137,11 @@ func TestRank(t *testing.T) {
 
 func TestPickerFailover(t *testing.T) {
 	ctx := context.Background()
-	stream := context.WithValue(ctx, streamPenaltyKey{}, time.Minute)
-	long := context.WithValue(ctx, streamPenaltyKey{}, time.Hour)
-	stalled, stall := context.WithCancelCause(stream)
+	stalled, stall := context.WithCancelCause(ctx)
 	stall(errStreamStalled)
-	cancelled, cancel := context.WithCancel(stream)
+	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	excused, stallExcused := context.WithCancelCause(context.WithValue(stream, excusedStallKey{}, true))
-	stallExcused(errStreamStalled)
-	avoidA, avoidB := AvoidNode(ctx, "a"), AvoidNode(ctx, "b")
+	avoidA, avoidB, avoidAB := AvoidNodes(ctx, "a"), AvoidNodes(ctx, "b"), AvoidNodes(ctx, "a", "b")
 	unavailable := status.Error(codes.Unavailable, "node down")
 	// drand nodes return plain errors, which reach the client as codes.Unknown
 	unknownRound := status.Error(codes.Unknown, "can't retrieve beacon 7")
@@ -162,9 +158,8 @@ func TestPickerFailover(t *testing.T) {
 		picks []pick
 	}{
 		{"node error moves to the next node", []pick{{nil, 0, ctx, unavailable, "a"}, {nil, 0, ctx, nil, "b"}}},
-		{"stream error moves to the next node", []pick{{nil, 0, stream, unknownRound, "a"}, {nil, 0, ctx, nil, "b"}}},
-		{"stall moves to the next node", []pick{
-			{nil, 0, stalled, status.Error(codes.Canceled, "stalled"), "a"}, {nil, 0, ctx, nil, "b"},
+		{"stall keeps the node", []pick{
+			{nil, 0, stalled, status.Error(codes.Canceled, "stalled"), "a"}, {nil, 0, ctx, nil, "a"},
 		}},
 		{"caller cancel keeps the node", []pick{
 			{nil, 0, cancelled, status.Error(codes.Canceled, "gone"), "a"}, {nil, 0, ctx, nil, "a"},
@@ -179,14 +174,14 @@ func TestPickerFailover(t *testing.T) {
 		{"expired penalty returns to the first node", []pick{
 			{nil, 0, ctx, unavailable, "a"}, {nil, time.Second, ctx, nil, "b"}, {nil, 59 * time.Second, ctx, nil, "a"},
 		}},
-		{"longer penalty wins", []pick{
-			{[]string{"a", "b"}, 0, long, unavailable, "a"}, {nil, time.Second, ctx, unavailable, "b"},
-			{nil, time.Second, ctx, unavailable, "a"}, {nil, 2 * time.Minute, ctx, nil, "b"},
-		}},
-		{"excused stall keeps the node", []pick{
-			{nil, 0, excused, status.Error(codes.Canceled, "stalled"), "a"}, {nil, 0, ctx, nil, "a"},
-		}},
 		{"avoid picks the next node for that call only", []pick{{nil, 0, avoidA, nil, "b"}, {nil, 0, ctx, nil, "a"}}},
+		{"avoid of several nodes picks the best other", []pick{{nil, 0, avoidAB, nil, "c"}, {nil, 0, ctx, nil, "a"}}},
+		{"avoid of every READY node keeps the usual node", []pick{
+			{[]string{"a", "b"}, 0, avoidAB, nil, "a"}, {nil, 0, AvoidNodes(ctx, "b", "c", "a"), nil, "a"},
+		}},
+		{"avoid of every READY node keeps a penalty", []pick{
+			{nil, 0, ctx, unavailable, "a"}, {nil, 0, AvoidNodes(ctx, "a", "b", "c"), nil, "b"},
+		}},
 		{"failed avoiding call penalizes the node it used", []pick{
 			{nil, 0, avoidA, unavailable, "b"}, {nil, 0, avoidA, nil, "c"}, {nil, 0, ctx, nil, "a"},
 		}},
@@ -199,7 +194,7 @@ func TestPickerFailover(t *testing.T) {
 		}},
 		{"avoid of another node keeps the first node", []pick{{nil, 0, avoidB, nil, "a"}, {nil, 0, ctx, nil, "a"}}},
 		{"avoid of an unknown node keeps the first node", []pick{
-			{nil, 0, AvoidNode(ctx, ""), nil, "a"}, {nil, 0, AvoidNode(ctx, "x"), nil, "a"},
+			{nil, 0, AvoidNodes(ctx, ""), nil, "a"}, {nil, 0, AvoidNodes(ctx, "x"), nil, "a"}, {nil, 0, AvoidNodes(ctx), nil, "a"},
 		}},
 		{"avoid with one READY node keeps it", []pick{{[]string{"a"}, 0, avoidA, nil, "a"}, {nil, 0, ctx, nil, "a"}}},
 		{"late READY node before penalized ones", []pick{
@@ -253,37 +248,6 @@ func TestPickerWalksEveryNode(t *testing.T) {
 				t.Fatalf("%d nodes: Pick %d = %s, want %s", n, i, got, want)
 			}
 			done(unavailable)
-		}
-	}
-}
-
-func TestStreamPenaltyCoversEveryNode(t *testing.T) {
-	addrs := []string{"a", "b", "c", "d"}
-	backoffs := map[string]func(c *Client, failures uint) time.Duration{
-		"longest backoff": func(c *Client, _ uint) time.Duration { return c.maxBackoff },
-		"actual backoff":  (*Client).backoff,
-	}
-	for name, backoff := range backoffs {
-		for _, period := range []time.Duration{time.Second, 3 * time.Second, 30 * time.Second} {
-			for n := 2; n <= len(addrs); n++ {
-				c := newClient(nil, nil)
-				c.nodes = n
-				stall := stallPeriods * period
-				stream := context.WithValue(context.Background(), streamPenaltyKey{}, c.streamPenalty(stall))
-				stalled, cancel := context.WithCancelCause(stream)
-				cancel(errStreamStalled)
-				tb := newTestBalancer(addrs[:n]...)
-				for i, want := range append(addrs[:n:n], "a") {
-					got, done := tb.pick(t, stalled)
-					if got != want {
-						t.Fatalf("%s, period %v, %d nodes: Pick %d = %s, want %s", name, period, n, i, got, want)
-					}
-					tb.clock = tb.clock.Add(stall)
-					done(status.Error(codes.Canceled, "stalled"))
-					tb.clock = tb.clock.Add(backoff(c, uint(i+1)))
-				}
-				c.cancel()
-			}
 		}
 	}
 }
@@ -373,29 +337,46 @@ func TestTrackNode(t *testing.T) {
 		}
 	}
 	// c is now first
-	tb.pick(t, AvoidNode(ctx, "c"))
+	tb.pick(t, AvoidNodes(ctx, "c"))
 	if got := last(); got != "a" {
 		t.Errorf("TrackNode() after avoiding c = %q, want \"a\"", got)
 	}
 }
 
-func TestAvoidNodeKeepsState(t *testing.T) {
-	tb := newTestBalancer("a", "b", "c")
-	for range 100 {
-		tb.clock = tb.clock.Add(time.Second)
-		if got, done := tb.pick(t, AvoidNode(context.Background(), "a")); got != "b" {
-			t.Fatalf("Pick(AvoidNode(a)) = %s, want b", got)
-		} else {
-			done(nil)
-		}
+func TestAvoidNodesKeepsState(t *testing.T) {
+	tests := []struct {
+		name  string
+		avoid []string
+		want  string
+	}{
+		{"first node", []string{"a"}, "b"},
+		{"two nodes", []string{"b", "a"}, "c"},
+		{"every node", []string{"a", "b", "c"}, "a"},
 	}
-	for addr, n := range tb.nodes {
-		if !n.penalizedUntil.IsZero() {
-			t.Errorf("node %s penalized until %v after avoids, want no penalty", addr, n.penalizedUntil)
-		}
-	}
-	if got, _ := tb.pick(t, context.Background()); got != "a" {
-		t.Errorf("Pick() after avoids of a = %s, want a", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tb := newTestBalancer("a", "b", "c")
+			before := tb.current.Load()
+			for range 100 {
+				tb.clock = tb.clock.Add(time.Second)
+				if got, done := tb.pick(t, AvoidNodes(context.Background(), tt.avoid...)); got != tt.want {
+					t.Fatalf("Pick(AvoidNodes(%v)) = %s, want %s", tt.avoid, got, tt.want)
+				} else {
+					done(nil)
+				}
+			}
+			if got := tb.current.Load(); got != before {
+				t.Errorf("choice after AvoidNodes(%v) = %+v, want %+v", tt.avoid, got, before)
+			}
+			for addr, n := range tb.nodes {
+				if !n.penalizedUntil.IsZero() {
+					t.Errorf("node %s penalized until %v after AvoidNodes(%v), want no penalty", addr, n.penalizedUntil, tt.avoid)
+				}
+			}
+			if got, _ := tb.pick(t, context.Background()); got != "a" {
+				t.Errorf("Pick() after AvoidNodes(%v) = %s, want a", tt.avoid, got)
+			}
+		})
 	}
 }
 
@@ -406,8 +387,8 @@ func TestBalancerConcurrency(t *testing.T) {
 	p := &picker{fb: tb.fallbackBalancer}
 	ctxs := []context.Context{
 		context.Background(),
-		AvoidNode(context.Background(), "a"),
-		context.WithValue(context.Background(), streamPenaltyKey{}, time.Millisecond),
+		AvoidNodes(context.Background(), "a"),
+		AvoidNodes(context.Background(), "a", "b"),
 	}
 	readySets := [][]string{{"a", "b", "c"}, {"b"}, {}, {"a", "c"}}
 	addrSets := [][]resolver.Address{resolved("a", "b", "c"), resolved("c", "a"), resolved("b")}
@@ -443,23 +424,36 @@ func TestBalancerConcurrency(t *testing.T) {
 
 func TestNodeFault(t *testing.T) {
 	ctx := context.Background()
+	stalled, stall := context.WithCancelCause(ctx)
+	stall(errStreamStalled)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	expired, expire := context.WithTimeout(ctx, 0)
+	defer expire()
 	internal := status.Error(codes.Internal, "grpc: error while marshaling")
+	unavailable := status.Error(codes.Unavailable, "node down")
 	tests := []struct {
-		name   string
-		di     balancer.DoneInfo
-		stream bool
-		want   bool
+		name string
+		ctx  context.Context
+		di   balancer.DoneInfo
+		want bool
 	}{
-		{"success", balancer.DoneInfo{BytesSent: true, BytesReceived: true}, false, false},
-		{"internal from the node", balancer.DoneInfo{Err: internal, BytesSent: true, BytesReceived: true}, false, true},
-		{"internal from the client", balancer.DoneInfo{Err: internal, BytesSent: true}, false, false},
-		{"internal from the client on a stream", balancer.DoneInfo{Err: internal, BytesSent: true}, true, true},
-		{"unavailable before any byte", balancer.DoneInfo{Err: status.Error(codes.Unavailable, "node down")}, false, true},
+		{"success", ctx, balancer.DoneInfo{BytesSent: true, BytesReceived: true}, false},
+		{"internal from the node", ctx, balancer.DoneInfo{Err: internal, BytesSent: true, BytesReceived: true}, true},
+		{"internal from the client", ctx, balancer.DoneInfo{Err: internal, BytesSent: true}, false},
+		{"unavailable before any byte", ctx, balancer.DoneInfo{Err: unavailable}, true},
+		{"resource exhausted", ctx, balancer.DoneInfo{Err: status.Error(codes.ResourceExhausted, "busy")}, true},
+		{"unimplemented", ctx, balancer.DoneInfo{Err: status.Error(codes.Unimplemented, "old node")}, true},
+		{"deadline exceeded", expired, balancer.DoneInfo{Err: status.Error(codes.DeadlineExceeded, "slow")}, true},
+		{"unknown from the node", ctx, balancer.DoneInfo{Err: status.Error(codes.Unknown, "no beacon yet"), BytesReceived: true}, false},
+		{"caller cancel", cancelled, balancer.DoneInfo{Err: status.Error(codes.Canceled, "gone")}, false},
+		{"caller cancel during an outage", cancelled, balancer.DoneInfo{Err: unavailable}, false},
+		{"stalled stream", stalled, balancer.DoneInfo{Err: status.Error(codes.Canceled, "stalled"), BytesReceived: true}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := nodeFault(ctx, tt.di, tt.stream); got != tt.want {
-				t.Errorf("nodeFault(%+v, stream %v) = %v, want %v", tt.di, tt.stream, got, tt.want)
+			if got := nodeFault(tt.ctx, tt.di); got != tt.want {
+				t.Errorf("nodeFault(%+v) = %v, want %v", tt.di, got, tt.want)
 			}
 		})
 	}

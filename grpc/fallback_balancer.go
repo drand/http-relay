@@ -72,7 +72,7 @@ func (f fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) b
 type fallbackBalancer struct {
 	// Embeds balancer.Balancer because needs to intercept UpdateClientConnState to learn state.
 	balancer.Balancer
-	// timeout is how long a node stays behind the others after failing a unary call.
+	// timeout is how long a node stays behind the others after failing a call.
 	timeout time.Duration
 	now     func() time.Time
 
@@ -108,8 +108,7 @@ type choice struct {
 //	unpenalized nodes  first, by configured order
 //	penalized nodes    last, oldest failure first, then by configured order
 //
-// A penalty ends at penalizedUntil. Penalized nodes are not sorted by the end of their penalty because unary calls and
-// streams penalize for different durations: sorting by failure sends every failing node to the back.
+// A penalty ends at penalizedUntil.
 func rank(nodes []*node, now time.Time) []*node {
 	ready := slices.DeleteFunc(slices.Clone(nodes), func(n *node) bool { return n.sc == nil })
 	slices.SortFunc(ready, func(a, b *node) int {
@@ -173,12 +172,12 @@ func (fb *fallbackBalancer) penalize(addr string, d time.Duration) {
 	fb.refresh(now)
 }
 
-// other returns the best-ranked READY node other than addr, nil if there is none.
-func (fb *fallbackBalancer) other(addr string) *choice {
+// other returns the best-ranked READY node not in avoid, nil if there is none.
+func (fb *fallbackBalancer) other(avoid []string) *choice {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	for _, n := range rank(slices.Collect(maps.Values(fb.nodes)), fb.now()) {
-		if n.addr != addr {
+		if !slices.Contains(avoid, n.addr) {
 			return &choice{sc: n.sc, addr: n.addr}
 		}
 	}
@@ -286,17 +285,13 @@ func (p *picker) String() string {
 type (
 	avoidKey struct{}
 	trackKey struct{}
-	// streamPenaltyKey marks a call whose every failure is the node's fault. Its time.Duration value is how long the
-	// node stays behind the others, which must outlast the time the caller takes to retry.
-	streamPenaltyKey struct{}
-	// excusedStallKey marks a stream whose stall is not the node's fault.
-	excusedStallKey struct{}
 )
 
-// AvoidNode returns a context whose calls go to the best-ranked READY node other than addr, or to the usual node when
-// no other is READY. It penalizes no node: a node that answers but lags is not demoted by /health.
-func AvoidNode(ctx context.Context, addr string) context.Context {
-	return context.WithValue(ctx, avoidKey{}, addr)
+// AvoidNodes returns a context whose calls go to the best-ranked READY node not in addrs, or to the usual node when
+// every READY node is in addrs. It penalizes no node: a node that lags, or fails a single chain, keeps serving the
+// others.
+func AvoidNodes(ctx context.Context, addrs ...string) context.Context {
+	return context.WithValue(ctx, avoidKey{}, slices.Clone(addrs))
 }
 
 // TrackNode returns a context that records the node picked for its calls, and a function returning the address of the
@@ -318,17 +313,13 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 		fbLog.Error("Pick had no available SubConn")
 		return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
 	}
-	if avoid, ok := info.Ctx.Value(avoidKey{}).(string); ok && avoid == c.addr {
+	if avoid, ok := info.Ctx.Value(avoidKey{}).([]string); ok && slices.Contains(avoid, c.addr) {
 		if o := fb.other(avoid); o != nil {
 			c = o
 		}
 	}
 	if last, ok := info.Ctx.Value(trackKey{}).(*atomic.Pointer[string]); ok {
 		last.Store(&c.addr)
-	}
-	penalty, stream := info.Ctx.Value(streamPenaltyKey{}).(time.Duration)
-	if !stream {
-		penalty = fb.timeout
 	}
 
 	// The metric for a subchannel should be atomically incremented by one
@@ -338,33 +329,23 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{
 		SubConn: c.sc,
 		Done: func(di balancer.DoneInfo) {
-			if nodeFault(info.Ctx, di, stream) {
-				fb.penalize(c.addr, penalty)
+			if nodeFault(info.Ctx, di) {
+				fb.penalize(c.addr, fb.timeout)
 			}
 		},
 		Metadata: metadata.MD{"target": []string{c.addr}},
 	}, nil
 }
 
-// nodeFault reports whether err means the node failed the call, rather than the caller giving up or asking for
-// something no node can serve. A stream we cancelled because the node stopped emitting beacons is the node's fault,
-// unless the stall is excused.
-// drand nodes report unknown chains and rounds as codes.Unknown, so outside of a stream only transport-level codes
-// count. The client reports its own failures, such as a request it cannot marshal, as codes.Internal before receiving
-// anything from the node.
-func nodeFault(ctx context.Context, di balancer.DoneInfo, stream bool) bool {
-	err := di.Err
-	if err == nil {
+// nodeFault reports whether the call failed because of the node, rather than the caller giving up, including on a
+// stalled stream, or asking for something the node cannot serve. drand nodes report unknown chains and rounds, and
+// chains without a beacon yet, as codes.Unknown, so only transport-level codes count. The client reports its own
+// failures, such as a request it cannot marshal, as codes.Internal before receiving anything from the node.
+func nodeFault(ctx context.Context, di balancer.DoneInfo) bool {
+	if di.Err == nil || errors.Is(ctx.Err(), context.Canceled) {
 		return false
 	}
-	if errors.Is(ctx.Err(), context.Canceled) {
-		excused, _ := ctx.Value(excusedStallKey{}).(bool)
-		return stream && !excused && errors.Is(context.Cause(ctx), errStreamStalled)
-	}
-	if stream {
-		return true
-	}
-	switch status.Code(err) {
+	switch status.Code(di.Err) {
 	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted, codes.Unimplemented:
 		return true
 	case codes.Internal:
