@@ -60,7 +60,9 @@ func serveMetrics() {
 	}))
 	http.Handle("/chanz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		slog.Debug("display channelz data on /chanz")
-		w.Write([]byte(grpc.UpdateMetrics(mClient)))
+		if _, err := w.Write([]byte(grpc.UpdateMetrics(mClient))); err != nil {
+			slog.Error("failed to write channelz response", "error", err)
+		}
 	}))
 	//nolint:gosec // Ignoring G114
 	if err := http.ListenAndServe(*metricFlag, nil); err != nil {
