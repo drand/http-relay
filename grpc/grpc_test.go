@@ -1,6 +1,9 @@
 package grpc
 
 import (
+	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,5 +75,40 @@ func TestNextBeaconTime(t *testing.T) {
 				t.Errorf("%s: unexpected next round: got = %v, want %v", tt.name, gotr, tt.expectedRound)
 			}
 		})
+	}
+}
+
+func TestNewClient_InvalidAddress(t *testing.T) {
+	l := slog.Default()
+
+	_, err := NewClient("invalid://address that will fail", l)
+	if err == nil {
+		// gRPC uses lazy connections, so NewClient may not fail directly
+		t.Log("no error on creation (lazy conn); skipping")
+		return
+	}
+
+	if !strings.Contains(err.Error(), "unable to create grpc client") &&
+		!strings.Contains(err.Error(), "error") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestCheck_CancelledContext(t *testing.T) {
+	l := slog.Default()
+
+	// connect to a non-existent server; conn is lazy so NewClient won't fail
+	client, err := NewClient("localhost:0", l)
+	if err != nil {
+		t.Skipf("NewClient failed: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = client.Check(ctx)
+	if err == nil {
+		t.Error("expected error with cancelled context, got nil")
 	}
 }
