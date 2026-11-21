@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +61,8 @@ type Client struct {
 	// streams is keyed by hex-encoded chain hash
 	streams                map[string]*sharedStream
 	minBackoff, maxBackoff time.Duration
+	// nodes is how many nodes serve the connection, the Next stream tries each of them before failing its callers.
+	nodes int
 }
 
 func newClient(pc proto.PublicClient, l logger) *Client {
@@ -73,6 +76,7 @@ func newClient(pc proto.PublicClient, l logger) *Client {
 		streams:       make(map[string]*sharedStream),
 		minBackoff:    defaultMinBackoff,
 		maxBackoff:    defaultMaxBackoff,
+		nodes:         1,
 	}
 }
 
@@ -114,6 +118,8 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	client := newClient(proto.NewPublicClient(conn), l)
 	client.conn = conn
 	client.serverAddr = serverAddr
+	// the fallback resolver splits its target on commas
+	client.nodes = strings.Count(serverAddr, ",") + 1
 
 	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms healthTimeout built-in above
 	_, err = client.GetChains(context.Background())
@@ -144,11 +150,12 @@ func (c *Client) GetBeacon(ctx context.Context, m *proto.Metadata, round uint64)
 		Metadata: m,
 	}
 
+	ctx, served := TrackNode(ctx)
 	randResp, err := c.pc.PublicRand(ctx, in)
 	if err != nil {
 		c.log.Debug("GetBeacon failed once")
-		// we do 1 retry (automagically with the next subconn thanks to the fallback LB) if it failed
-		randResp, err = c.pc.PublicRand(ctx, in)
+		// the balancer only moves on by itself after transport failures, a node lagging behind returns plain errors
+		randResp, err = c.pc.PublicRand(AvoidNodes(ctx, served()), in)
 		if err != nil {
 			return nil, err
 		}
@@ -195,13 +202,14 @@ func (c *Client) Check(ctx context.Context) error {
 
 	client := healthgrpc.NewHealthClient(c.conn)
 
+	ctx, served := TrackNode(ctx)
 	tctx, cancel := context.WithTimeout(ctx, c.healthTimeout)
 	defer cancel()
 
 	resp, err := client.Check(tctx, &healthgrpc.HealthCheckRequest{})
 	if err != nil {
-		// we do 1 retry (automagically with the next subconn thanks to the fallback LB) if it failed
-		resp, err = client.Check(ctx, &healthgrpc.HealthCheckRequest{})
+		// the balancer only moves on by itself after transport failures
+		resp, err = client.Check(AvoidNodes(ctx, served()), &healthgrpc.HealthCheckRequest{})
 		if err != nil {
 			return err
 		}
