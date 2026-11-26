@@ -381,11 +381,15 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 }
 
 // nodeFault reports whether the call failed because of the node, rather than the caller giving up, including on a
-// stalled stream, or asking for something the node cannot serve. drand nodes report unknown chains and rounds, and
-// chains without a beacon yet, as codes.Unknown, so only transport-level codes count. The client reports its own
-// failures, such as a request it cannot marshal, as codes.Internal before receiving anything from the node.
+// stalled stream, or asking for something the node cannot serve. Within an attempt started by Client.retry, the caller
+// gives up when its own context ends, and the attempt deadline is the node's fault. drand nodes report unknown chains and
+// rounds, and chains without a beacon yet, as codes.Unknown, so only transport-level codes count. The client reports
+// its own failures, such as a request it cannot marshal, as codes.Internal before receiving anything from the node.
 func nodeFault(ctx context.Context, di balancer.DoneInfo) bool {
 	if di.Err == nil || errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	if caller, ok := ctx.Value(callerKey{}).(context.Context); ok && caller.Err() != nil {
 		return false
 	}
 	switch status.Code(di.Err) {

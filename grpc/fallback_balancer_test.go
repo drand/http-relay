@@ -493,6 +493,11 @@ func TestNodeFault(t *testing.T) {
 	cancel()
 	expired, expire := context.WithTimeout(ctx, 0)
 	defer expire()
+	timedOut, timeOut := attemptContext(ctx, 0)
+	defer timeOut()
+	callerExpired, callerTimeOut := attemptContext(expired, time.Hour)
+	defer callerTimeOut()
+	deadline := status.Error(codes.DeadlineExceeded, "context deadline exceeded")
 	internal := status.Error(codes.Internal, "grpc: error while marshaling")
 	unavailable := status.Error(codes.Unavailable, "node down")
 	tests := []struct {
@@ -507,7 +512,11 @@ func TestNodeFault(t *testing.T) {
 		{"unavailable before any byte", ctx, balancer.DoneInfo{Err: unavailable}, true},
 		{"resource exhausted", ctx, balancer.DoneInfo{Err: status.Error(codes.ResourceExhausted, "busy")}, true},
 		{"unimplemented", ctx, balancer.DoneInfo{Err: status.Error(codes.Unimplemented, "old node")}, true},
-		{"deadline exceeded", expired, balancer.DoneInfo{Err: status.Error(codes.DeadlineExceeded, "slow")}, true},
+		{"deadline exceeded from the node", ctx, balancer.DoneInfo{Err: deadline, BytesReceived: true}, true},
+		{"deadline exceeded without an attempt", expired, balancer.DoneInfo{Err: deadline}, true},
+		{"attempt timeout", timedOut, balancer.DoneInfo{Err: deadline}, true},
+		{"caller deadline", callerExpired, balancer.DoneInfo{Err: deadline}, false},
+		{"caller deadline during an outage", callerExpired, balancer.DoneInfo{Err: unavailable}, false},
 		{"unknown from the node", ctx, balancer.DoneInfo{Err: status.Error(codes.Unknown, "no beacon yet"), BytesReceived: true}, false},
 		{"caller cancel", cancelled, balancer.DoneInfo{Err: status.Error(codes.Canceled, "gone")}, false},
 		{"caller cancel during an outage", cancelled, balancer.DoneInfo{Err: unavailable}, false},

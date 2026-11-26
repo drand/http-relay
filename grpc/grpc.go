@@ -24,7 +24,11 @@ import (
 
 var clock func() time.Time
 
+// FallbackTimeout is the first penalty of a node that fails a call, see the fallback balancer.
 var FallbackTimeout = 3 * time.Second
+
+// defaultTimeout bounds an attempt of a unary call that the node answers without waiting for a beacon.
+const defaultTimeout = 5 * time.Second
 
 func init() {
 	balancer.Register(NewFallbackBuilder(FallbackTimeout))
@@ -43,16 +47,16 @@ type logger interface {
 	Debug(msg string, args ...any)
 }
 
-// Client represent a drand GRPC client, it connects to a single node at serverAddr, stores the connection in conn
-// it has a knownChains map of known chain info keyed using the hex-encoded chainhash of a beacon chain. The healthTimeout
-// is used for health checks only currently.
+// Client represent a drand GRPC client, it connects to the nodes at serverAddr, stores the connection in conn
+// it has a knownChains map of known chain info keyed using the hex-encoded chainhash of a beacon chain.
 type Client struct {
-	conn          *grpc.ClientConn
-	pc            proto.PublicClient
-	serverAddr    string
-	knownChains   sync.Map
-	healthTimeout time.Duration
-	log           logger
+	conn        *grpc.ClientConn
+	pc          proto.PublicClient
+	serverAddr  string
+	knownChains sync.Map
+	// timeout bounds each attempt of a unary call, see retry.
+	timeout time.Duration
+	log     logger
 
 	// ctx bounds the shared streams used by Next, Close cancels it.
 	ctx    context.Context
@@ -68,20 +72,19 @@ type Client struct {
 func newClient(pc proto.PublicClient, l logger) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
-		pc:            pc,
-		healthTimeout: time.Second,
-		log:           l,
-		ctx:           ctx,
-		cancel:        cancel,
-		streams:       make(map[string]*sharedStream),
-		minBackoff:    defaultMinBackoff,
-		maxBackoff:    defaultMaxBackoff,
-		nodes:         1,
+		pc:         pc,
+		timeout:    defaultTimeout,
+		log:        l,
+		ctx:        ctx,
+		cancel:     cancel,
+		streams:    make(map[string]*sharedStream),
+		minBackoff: defaultMinBackoff,
+		maxBackoff: defaultMaxBackoff,
+		nodes:      1,
 	}
 }
 
-// NewClient establishes a new non-TLS grpc connection to the provided server address. It takes a logger and uses
-// a default value for healthTimeout.
+// NewClient establishes a new non-TLS grpc connection to the provided server address. It takes a logger.
 func NewClient(serverAddr string, l logger) (*Client, error) {
 	l.Debug("NewClient", "serverAddr", serverAddr)
 
@@ -100,10 +103,13 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 		l.Error("failed to register grpc client metrics", "err", err)
 	}
 
+	client := newClient(nil, l)
 	conn, err := grpc.NewClient(serverAddr,
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"logging_pick_first_with_fallback"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithChainUnaryInterceptor(
+			// first, so that the metrics and logs see each attempt
+			client.retry,
 			clMetrics.UnaryClientInterceptor(),
 			UsedEndpointInterceptor(l),
 		),
@@ -115,22 +121,63 @@ func NewClient(serverAddr string, l logger) (*Client, error) {
 	if err != nil {
 		l.Error("Unable to dial new grpc client", "err", err)
 	}
-	client := newClient(proto.NewPublicClient(conn), l)
+	client.pc = proto.NewPublicClient(conn)
 	client.conn = conn
 	client.serverAddr = serverAddr
 	// the fallback resolver splits its target on commas
 	client.nodes = strings.Count(serverAddr, ",") + 1
 
-	// we do a GetChains call to pre-populate the knownChains, note that we have a 500ms healthTimeout built-in above
+	// we do a GetChains call to pre-populate the knownChains
 	_, err = client.GetChains(context.Background())
 	return client, err
 }
 
-// SetTimeout allows to set your own healthTimeout for GRPC health checks.
+// SetTimeout sets how long an attempt of a unary call may take before the node is penalized and the call retried on
+// another one. Calls that the node holds until a beacon arrives get one chain period and a second more. It is not safe
+// to call concurrently with calls, and does not apply to the GetChains call of NewClient.
 func (c *Client) SetTimeout(timeout time.Duration) {
 	c.log.Debug("Client SetTimeout")
 
-	c.healthTimeout = timeout
+	c.timeout = timeout
+}
+
+type callerKey struct{}
+
+// attemptTimeout replaces Client.timeout for one call.
+type attemptTimeout struct {
+	grpc.EmptyCallOption
+	d time.Duration
+}
+
+// attemptContext returns the context of an attempt that ends after d, keeping ctx for nodeFault to tell the caller's
+// deadline from the attempt's.
+func attemptContext(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithValue(ctx, callerKey{}, ctx), d)
+}
+
+// retry is a unary interceptor bounding each attempt by c.timeout, that retries a failed call once on another node
+// unless the caller gave up. The balancer only moves on by itself after transport failures, while a node lagging
+// behind, or missing a chain, returns plain errors.
+func (c *Client) retry(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	d := c.timeout
+	for _, o := range opts {
+		if t, ok := o.(attemptTimeout); ok {
+			d = t.d
+		}
+	}
+	attempt := func(ctx context.Context) error {
+		ctx, cancel := attemptContext(ctx, d)
+		defer cancel()
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+
+	ctx, served := TrackNode(ctx)
+	err := attempt(ctx)
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	c.log.Debug("retrying on another node", "method", method, "node", served(), "err", err)
+	return attempt(AvoidNodes(ctx, served()))
 }
 
 func (c *Client) Close() error {
@@ -150,15 +197,20 @@ func (c *Client) GetBeacon(ctx context.Context, m *proto.Metadata, round uint64)
 		Metadata: m,
 	}
 
-	ctx, served := TrackNode(ctx)
-	randResp, err := c.pc.PublicRand(ctx, in)
-	if err != nil {
-		c.log.Debug("GetBeacon failed once")
-		// the balancer only moves on by itself after transport failures, a node lagging behind returns plain errors
-		randResp, err = c.pc.PublicRand(AvoidNodes(ctx, served()), in)
+	var opts []grpc.CallOption
+	if round > 0 {
+		info, err := c.GetChainInfo(ctx, m)
 		if err != nil {
 			return nil, err
 		}
+		// A node holds a request for the round after its latest one until that round arrives, for at most one
+		// period and a second: the relay asks for it whenever its clock is ahead of the chain.
+		wait := time.Duration(info.Period)*time.Second + time.Second
+		opts = append(opts, attemptTimeout{d: wait + c.timeout})
+	}
+	randResp, err := c.pc.PublicRand(ctx, in, opts...)
+	if err != nil {
+		return nil, err
 	}
 
 	return NewHexBeacon(randResp), nil
@@ -200,19 +252,9 @@ func (c *Client) Watch(ctx context.Context, m *proto.Metadata) <-chan *HexBeacon
 func (c *Client) Check(ctx context.Context) error {
 	c.log.Debug("Client Check")
 
-	client := healthgrpc.NewHealthClient(c.conn)
-
-	ctx, served := TrackNode(ctx)
-	tctx, cancel := context.WithTimeout(ctx, c.healthTimeout)
-	defer cancel()
-
-	resp, err := client.Check(tctx, &healthgrpc.HealthCheckRequest{})
+	resp, err := healthgrpc.NewHealthClient(c.conn).Check(ctx, &healthgrpc.HealthCheckRequest{})
 	if err != nil {
-		// the balancer only moves on by itself after transport failures
-		resp, err = client.Check(AvoidNodes(ctx, served()), &healthgrpc.HealthCheckRequest{})
-		if err != nil {
-			return err
-		}
+		return err
 	}
 
 	if resp.GetStatus() != healthgrpc.HealthCheckResponse_SERVING {

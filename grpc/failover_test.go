@@ -9,7 +9,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	proto "github.com/drand/drand/v2/protobuf/drand"
@@ -40,27 +42,56 @@ var (
 	builtBalancers    = make(chan *fallbackBalancer, 1)
 )
 
-// streamNode is a drand node whose PublicRandStream fails with fail, or sends one beacon when fail is nil. Its
-// PublicRand fails with randErr, or returns round 42 when randErr is nil.
+// streamNode is a drand node whose PublicRandStream fails with fail, or sends one beacon when fail is nil. Its unary
+// calls wait for wait, or until the caller leaves, then fail with err, or answer for round 42 when err is nil.
 type streamNode struct {
 	proto.UnimplementedPublicServer
-	name    string
-	fail    func(proto.Public_PublicRandStreamServer) error
-	randErr error
-	opened  func(name string)
+	name   string
+	fail   func(proto.Public_PublicRandStreamServer) error
+	err    error
+	wait   time.Duration
+	opened func(name string)
+	// calls counts the unary calls the node received.
+	calls atomic.Int32
 }
 
-func (n *streamNode) PublicRand(context.Context, *proto.PublicRandRequest) (*proto.PublicRandResponse, error) {
-	if n.randErr != nil {
-		return nil, n.randErr
+func (n *streamNode) unary(ctx context.Context) error {
+	n.calls.Add(1)
+	if n.wait > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(n.wait):
+		}
+	}
+	return n.err
+}
+
+func (n *streamNode) PublicRand(ctx context.Context, _ *proto.PublicRandRequest) (*proto.PublicRandResponse, error) {
+	if err := n.unary(ctx); err != nil {
+		return nil, err
 	}
 	return &proto.PublicRandResponse{Round: 42}, nil
 }
 
-func (n *streamNode) ChainInfo(context.Context, *proto.ChainInfoRequest) (*proto.ChainInfoPacket, error) {
+func (n *streamNode) ChainInfo(ctx context.Context, _ *proto.ChainInfoRequest) (*proto.ChainInfoPacket, error) {
+	if err := n.unary(ctx); err != nil {
+		return nil, err
+	}
 	return &proto.ChainInfoPacket{
 		Period:   fakePeriod,
+		Hash:     fakeChainHash,
 		Metadata: &proto.Metadata{BeaconID: "default", ChainHash: fakeChainHash},
+	}, nil
+}
+
+func (n *streamNode) ListBeaconIDs(ctx context.Context, _ *proto.ListBeaconIDsRequest) (*proto.ListBeaconIDsResponse, error) {
+	if err := n.unary(ctx); err != nil {
+		return nil, err
+	}
+	return &proto.ListBeaconIDsResponse{
+		Ids:       []string{"default"},
+		Metadatas: []*proto.Metadata{{BeaconID: "default", ChainHash: fakeChainHash}},
 	}, nil
 }
 
@@ -128,9 +159,13 @@ func serve(t *testing.T, nodes ...*streamNode) (*Client, *fallbackBalancer, func
 		listeners[addr] = lis
 	}
 
+	c := newClient(nil, slog.New(slog.DiscardHandler))
+	t.Cleanup(c.cancel)
+	c.minBackoff, c.maxBackoff, c.nodes = time.Millisecond, 10*time.Millisecond, len(addrs)
 	conn, err := grpc.NewClient("fallback:///"+strings.Join(addrs, ","),
 		grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"recording_`+fallbackName+`"}`),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(c.retry),
 		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
 			return listeners[addr].DialContext(ctx)
 		}),
@@ -143,9 +178,7 @@ func serve(t *testing.T, nodes ...*streamNode) (*Client, *fallbackBalancer, func
 	fb := <-builtBalancers
 	waitReady(t, fb, len(addrs))
 
-	c := newClient(proto.NewPublicClient(conn), slog.New(slog.DiscardHandler))
-	t.Cleanup(c.cancel)
-	c.minBackoff, c.maxBackoff, c.nodes = time.Millisecond, 10*time.Millisecond, len(addrs)
+	c.pc, c.conn = proto.NewPublicClient(conn), conn
 	return c, fb, func() []string {
 		mu.Lock()
 		defer mu.Unlock()
@@ -231,28 +264,155 @@ func TestNextStreamErrorOnEveryNode(t *testing.T) {
 		if got := penalized(fb); len(got) != 0 {
 			t.Errorf("after Next() %d, penalized nodes = %v, want none", i, got)
 		}
-		ctx, served := TrackNode(context.Background())
-		if _, err := c.pc.ChainInfo(ctx, &proto.ChainInfoRequest{}); err != nil || served() != "a" {
-			t.Errorf("after Next() %d, ChainInfo() = %v on %q, want nil on a", i, err, served())
+		if got := next(fb); got != "a" {
+			t.Errorf("after Next() %d, next pick = %s, want a", i, got)
 		}
 	}
 }
 
-func TestGetBeaconRetriesOnAnotherNode(t *testing.T) {
-	c, fb, _ := serve(t, &streamNode{randErr: errors.New("beacon not found")}, &streamNode{})
-	for i := range 3 {
-		ctx, served := TrackNode(context.Background())
-		b, err := c.GetBeacon(ctx, byBeaconID, 42)
-		if err != nil || b.Round != 42 || served() != "b" {
-			t.Fatalf("GetBeacon() %d = %v, %v from %q, want round 42 from b", i, b, err, served())
-		}
-		if got := penalized(fb); len(got) != 0 {
-			t.Errorf("after GetBeacon() %d, penalized nodes = %v, want none", i, got)
-		}
-		ctx, served = TrackNode(context.Background())
-		if _, err := c.pc.PublicRand(ctx, &proto.PublicRandRequest{}); err == nil || served() != "a" {
-			t.Errorf("after GetBeacon() %d, PublicRand() = %v on %q, want an error from a", i, err, served())
-		}
+// next returns the node fb picks for the next call.
+func next(fb *fallbackBalancer) string {
+	if c := fb.choose(); c != nil {
+		return c.addr
+	}
+	return ""
+}
+
+func TestUnaryRetriesOnAnotherNode(t *testing.T) {
+	// drand nodes return plain errors, for a chain they do not serve for instance
+	plain := errors.New("unknown chain")
+	tests := []struct {
+		name      string
+		call      func(*Client, context.Context) error
+		errs      []error // of the nodes a, b, c
+		wantErr   bool
+		wantCalls []int32
+	}{
+		{"ChainInfo", func(c *Client, ctx context.Context) error {
+			_, err := c.GetChainInfo(ctx, byBeaconID)
+			return err
+		}, []error{plain, nil, nil}, false, []int32{1, 1, 0}},
+		{"ListBeaconIDs", func(c *Client, ctx context.Context) error {
+			_, _, err := c.GetBeaconIds(ctx)
+			return err
+		}, []error{plain, nil, nil}, false, []int32{1, 1, 0}},
+		{"ListBeaconIDs and ChainInfo", func(c *Client, ctx context.Context) error {
+			_, err := c.GetChains(ctx)
+			return err
+		}, []error{plain, nil, nil}, false, []int32{2, 2, 0}},
+		{"latest PublicRand", func(c *Client, ctx context.Context) error {
+			_, err := c.GetBeacon(ctx, byBeaconID, 0)
+			return err
+		}, []error{plain, nil, nil}, false, []int32{1, 1, 0}},
+		{"PublicRand of a round, after ChainInfo", func(c *Client, ctx context.Context) error {
+			_, err := c.GetBeacon(ctx, byBeaconID, 42)
+			return err
+		}, []error{plain, nil, nil}, false, []int32{2, 2, 0}},
+		{"one retry only", func(c *Client, ctx context.Context) error {
+			_, err := c.GetChainInfo(ctx, byBeaconID)
+			return err
+		}, []error{plain, plain, nil}, true, []int32{1, 1, 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodes := make([]*streamNode, len(tt.errs))
+			for i, err := range tt.errs {
+				nodes[i] = &streamNode{err: err}
+			}
+			c, fb, _ := serve(t, nodes...)
+			for i := range 3 {
+				for _, n := range nodes {
+					n.calls.Store(0)
+				}
+				ctx, served := TrackNode(context.Background())
+				err := tt.call(c, ctx)
+				if gotErr := err != nil; gotErr != tt.wantErr {
+					t.Fatalf("call %d = %v, want error %v", i, err, tt.wantErr)
+				}
+				if !tt.wantErr && served() != "b" {
+					t.Errorf("call %d served by %q, want b", i, served())
+				}
+				calls := make([]int32, len(nodes))
+				for j, n := range nodes {
+					calls[j] = n.calls.Load()
+				}
+				if !slices.Equal(calls, tt.wantCalls) {
+					t.Errorf("call %d made %v calls to a, b, c, want %v", i, calls, tt.wantCalls)
+				}
+				if got := penalized(fb); len(got) != 0 {
+					t.Errorf("after call %d, penalized nodes = %v, want none", i, got)
+				}
+				if got := next(fb); got != "a" {
+					t.Errorf("after call %d, next pick = %s, want a", i, got)
+				}
+				// the first call cached the chain info
+				c.knownChains.Clear()
+			}
+		})
+	}
+}
+
+func TestUnaryAttemptTimeout(t *testing.T) {
+	const timeout = time.Second
+	// a node waits for the round after its latest one for one period and a second, then gives up
+	roundWait := fakePeriod*time.Second + time.Second
+	never := errors.New("unreachable")
+	// the cache only knows the chain by beacon ID
+	chainInfo := func(c *Client, ctx context.Context) error {
+		_, err := c.GetChainInfo(ctx, byChainHash)
+		return err
+	}
+	round := func(c *Client, ctx context.Context) error {
+		_, err := c.GetBeacon(ctx, byBeaconID, 42)
+		return err
+	}
+	tests := []struct {
+		name          string
+		call          func(*Client, context.Context) error
+		wait          time.Duration // of node a, b answers at once
+		err           error         // of node a
+		deadline      time.Duration // of the caller, none when zero
+		wantCode      codes.Code
+		wantElapsed   time.Duration
+		wantPenalized []string
+		wantCallsB    int32
+	}{
+		{"hanging ChainInfo", chainInfo, time.Hour, nil, 0, codes.OK, timeout, []string{"a"}, 1},
+		{"hanging PublicRand of a round", round, time.Hour, nil, 0, codes.OK, roundWait + timeout, []string{"a"}, 1},
+		{"node waiting for the next round", round, roundWait, errors.New("waited too long"), 0, codes.OK, roundWait, nil, 1},
+		{"caller deadline first", chainInfo, time.Hour, never, timeout / 2, codes.DeadlineExceeded, timeout / 2, nil, 0},
+		{"caller deadline during a round wait", round, time.Hour, never, roundWait, codes.DeadlineExceeded, roundWait, nil, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				a, b := &streamNode{wait: tt.wait, err: tt.err}, &streamNode{}
+				c, fb, _ := serve(t, a, b)
+				c.timeout = timeout
+				c.knownChains.Store("default", &JsonInfoV2{Period: fakePeriod, Hash: fakeChainHash, BeaconId: "default"})
+				ctx := context.Background()
+				if tt.deadline > 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tt.deadline)
+					defer cancel()
+				}
+
+				start := time.Now()
+				err := tt.call(c, ctx)
+				if got := status.Code(err); got != tt.wantCode {
+					t.Errorf("call = %v, want code %v", err, tt.wantCode)
+				}
+				if elapsed := time.Since(start); elapsed != tt.wantElapsed {
+					t.Errorf("call took %v, want %v", elapsed, tt.wantElapsed)
+				}
+				if got := penalized(fb); !slices.Equal(got, tt.wantPenalized) {
+					t.Errorf("penalized nodes = %v, want %v", got, tt.wantPenalized)
+				}
+				if got := b.calls.Load(); got != tt.wantCallsB {
+					t.Errorf("calls to b = %d, want %d", got, tt.wantCallsB)
+				}
+			})
+		})
 	}
 }
 
