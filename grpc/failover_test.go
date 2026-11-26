@@ -51,6 +51,8 @@ type streamNode struct {
 	err    error
 	wait   time.Duration
 	opened func(name string)
+	// maxStreams caps the concurrent calls of a connection when set.
+	maxStreams uint32
 	// calls counts the unary calls the node received.
 	calls atomic.Int32
 }
@@ -152,7 +154,11 @@ func serve(t *testing.T, nodes ...*streamNode) (*Client, *fallbackBalancer, func
 	for i, addr := range addrs {
 		nodes[i].name, nodes[i].opened = addr, record
 		lis := bufconn.Listen(1 << 16)
-		srv := grpc.NewServer()
+		var opts []grpc.ServerOption
+		if nodes[i].maxStreams > 0 {
+			opts = append(opts, grpc.MaxConcurrentStreams(nodes[i].maxStreams))
+		}
+		srv := grpc.NewServer(opts...)
 		proto.RegisterPublicServer(srv, nodes[i])
 		go func() { _ = srv.Serve(lis) }()
 		t.Cleanup(srv.Stop)
@@ -350,6 +356,37 @@ func TestUnaryRetriesOnAnotherNode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestQueuedCallTimeout checks that a call timing out while queued behind the MaxConcurrentStreams of a node, which
+// never saw it, does not penalize the node.
+func TestQueuedCallTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, b := &streamNode{wait: time.Hour, maxStreams: 1}, &streamNode{}
+		c, fb, _ := serve(t, a, b)
+		c.timeout = time.Second
+
+		parked, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = c.pc.ChainInfo(parked, &proto.ChainInfoRequest{}, attemptTimeout{d: time.Hour})
+		}()
+		synctest.Wait()
+
+		ctx, served := TrackNode(context.Background())
+		if _, err := c.pc.ChainInfo(ctx, &proto.ChainInfoRequest{}); err != nil || served() != "b" {
+			t.Errorf("ChainInfo() behind a parked call = %v from %q, want nil from b", err, served())
+		}
+		if got := a.calls.Load(); got != 1 {
+			t.Errorf("calls to a = %d, want only the parked one", got)
+		}
+		if got := penalized(fb); len(got) != 0 {
+			t.Errorf("penalized nodes = %v, want none", got)
+		}
+		cancel()
+		<-done
+	})
 }
 
 func TestUnaryAttemptTimeout(t *testing.T) {

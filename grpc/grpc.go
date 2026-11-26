@@ -204,7 +204,8 @@ func (c *Client) GetBeacon(ctx context.Context, m *proto.Metadata, round uint64)
 			return nil, err
 		}
 		// A node holds a request for the round after its latest one until that round arrives, for at most one
-		// period and a second: the relay asks for it whenever its clock is ahead of the chain.
+		// period and a second: the relay asks for it whenever its clock is ahead of the chain. So a hung node is only
+		// detected that late on round requests.
 		wait := time.Duration(info.Period)*time.Second + time.Second
 		opts = append(opts, attemptTimeout{d: wait + c.timeout})
 	}

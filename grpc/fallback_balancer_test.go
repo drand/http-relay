@@ -97,9 +97,12 @@ func TestRank(t *testing.T) {
 			n("a", 0, ready, time.Second, time.Minute), n("b", 1, ready, 3*time.Second, time.Minute),
 			n("c", 2, ready, 2*time.Second, time.Minute),
 		}, []string{"b", "c", "a"}},
-		{"penalized by failure, not by end of penalty", []*node{
+		{"penalized by end of penalty, not by failure", []*node{
 			n("a", 0, ready, 2*time.Second, time.Hour), n("b", 1, ready, time.Second, time.Minute),
-		}, []string{"a", "b"}},
+		}, []string{"b", "a"}},
+		{"same end of penalty by oldest failure", []*node{
+			n("a", 0, ready, time.Second, time.Minute), n("b", 1, ready, 2*time.Second, time.Minute),
+		}, []string{"b", "a"}},
 		{"same failure by configured order", []*node{
 			n("b", 1, ready, time.Second, time.Minute), n("a", 0, ready, time.Second, time.Minute),
 		}, []string{"a", "b"}},
@@ -232,47 +235,57 @@ func TestPickerFailover(t *testing.T) {
 }
 
 func TestPenaltyGrowth(t *testing.T) {
-	tb := newTestBalancer("a", "b")
-	tb.timeout = 10 * time.Second
-	ctx := context.Background()
-	unavailable := status.Error(codes.Unavailable, "node down")
-	fail := func(ctx context.Context) {
-		t.Helper()
-		if got, done := tb.pick(t, ctx); got != "a" {
-			t.Fatalf("Pick() = %s, want a", got)
-		} else {
-			done(unavailable)
-		}
+	const base = 10 * time.Second
+	// step fails a call on a at after the end of its current penalty, once a served a call when succeed is set
+	type step struct {
+		after   time.Duration
+		succeed bool
+		want    time.Duration // penalty of a after the failure
 	}
-	penalty := func() time.Duration { return tb.nodes["a"].penalizedUntil.Sub(tb.clock) }
-
-	for i, want := range []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second, time.Minute, time.Minute} {
-		fail(ctx)
-		if got := penalty(); got != want {
-			t.Errorf("penalty after %d failures = %v, want %v", i+1, got, want)
-		}
-		tb.clock = tb.clock.Add(time.Second)
-		if got, _ := tb.pick(t, ctx); got != "b" {
-			t.Errorf("Pick() during penalty %d = %s, want b", i+1, got)
-		}
-		fail(AvoidNodes(ctx, "b"))
-		if got := penalty(); got != want {
-			t.Errorf("penalty after a failure during penalty %d = %v, want %v", i+1, got, want)
-		}
-		tb.clock = tb.nodes["a"].penalizedUntil
+	tests := []struct {
+		name  string
+		steps []step
+	}{
+		{"doubles up to the cap", []step{
+			{0, false, base}, {0, false, 2 * base}, {0, false, 4 * base}, {0, false, maxPenalty}, {0, false, maxPenalty},
+		}},
+		{"failure during a penalty does not double it", []step{
+			{0, false, base}, {0, false, 2 * base}, {-time.Second, false, 2 * base}, {0, false, 4 * base},
+		}},
+		{"success does not reset", []step{{0, false, base}, {0, false, 2 * base}, {time.Second, true, 4 * base}}},
+		{"quiet period resets", []step{{0, false, base}, {0, false, 2 * base}, {maxPenalty, false, base}}},
+		{"failure just before the end of the quiet period doubles", []step{
+			{0, false, base}, {maxPenalty - time.Nanosecond, true, 2 * base},
+		}},
 	}
-
-	got, done := tb.pick(t, ctx)
-	if got != "a" {
-		t.Fatalf("Pick() after the penalties = %s, want a", got)
-	}
-	done(nil)
-	if c := tb.current.Load(); c.failed {
-		t.Errorf("choice after a success on a = %+v, want it not failed", c)
-	}
-	fail(ctx)
-	if got := penalty(); got != tb.timeout {
-		t.Errorf("penalty after a success and a failure = %v, want %v", got, tb.timeout)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tb := newTestBalancer("a", "b")
+			tb.timeout = base
+			// a is picked even while penalized
+			ctx := AvoidNodes(context.Background(), "b")
+			for i, st := range tt.steps {
+				if end := tb.nodes["a"].penalizedUntil; !end.IsZero() {
+					tb.clock = end.Add(st.after)
+				}
+				if st.succeed {
+					_, done := tb.pick(t, ctx)
+					done(nil)
+				}
+				_, done := tb.pick(t, ctx)
+				done(status.Error(codes.Unavailable, "node down"))
+				if got := tb.nodes["a"].penalizedUntil.Sub(tb.clock); got != st.want {
+					t.Errorf("penalty after step %d = %v, want %v", i, got, st.want)
+				}
+				if got, _ := tb.pick(t, context.Background()); got != "b" {
+					t.Errorf("Pick() during penalty %d = %s, want b", i, got)
+				}
+			}
+			tb.clock = tb.nodes["a"].penalizedUntil
+			if got, _ := tb.pick(t, context.Background()); got != "a" {
+				t.Errorf("Pick() after the last penalty = %s, want a", got)
+			}
+		})
 	}
 }
 
@@ -512,10 +525,11 @@ func TestNodeFault(t *testing.T) {
 		{"unavailable before any byte", ctx, balancer.DoneInfo{Err: unavailable}, true},
 		{"resource exhausted", ctx, balancer.DoneInfo{Err: status.Error(codes.ResourceExhausted, "busy")}, true},
 		{"unimplemented", ctx, balancer.DoneInfo{Err: status.Error(codes.Unimplemented, "old node")}, true},
-		{"deadline exceeded from the node", ctx, balancer.DoneInfo{Err: deadline, BytesReceived: true}, true},
-		{"deadline exceeded without an attempt", expired, balancer.DoneInfo{Err: deadline}, true},
-		{"attempt timeout", timedOut, balancer.DoneInfo{Err: deadline}, true},
-		{"caller deadline", callerExpired, balancer.DoneInfo{Err: deadline}, false},
+		{"deadline exceeded from the node", ctx, balancer.DoneInfo{Err: deadline, BytesSent: true, BytesReceived: true}, true},
+		{"deadline exceeded without an attempt", expired, balancer.DoneInfo{Err: deadline, BytesSent: true}, true},
+		{"attempt timeout", timedOut, balancer.DoneInfo{Err: deadline, BytesSent: true}, true},
+		{"attempt timeout while queued for a stream", timedOut, balancer.DoneInfo{Err: deadline}, false},
+		{"caller deadline", callerExpired, balancer.DoneInfo{Err: deadline, BytesSent: true}, false},
 		{"caller deadline during an outage", callerExpired, balancer.DoneInfo{Err: unavailable}, false},
 		{"unknown from the node", ctx, balancer.DoneInfo{Err: status.Error(codes.Unknown, "no beacon yet"), BytesReceived: true}, false},
 		{"caller cancel", cancelled, balancer.DoneInfo{Err: status.Error(codes.Canceled, "gone")}, false},
