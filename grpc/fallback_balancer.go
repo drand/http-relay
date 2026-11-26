@@ -93,7 +93,7 @@ type node struct {
 	sc             balancer.SubConn // nil unless READY
 	failedAt       time.Time
 	penalizedUntil time.Time
-	// penalty is the length of the last penalty.
+	// penalty is the length of the last penalty, zero once the node served a call.
 	penalty time.Duration
 }
 
@@ -103,14 +103,26 @@ type choice struct {
 	addr string
 	// validUntil is when the first penalty among the READY nodes ends, zero if none is penalized.
 	validUntil time.Time
+	// failedAt is the last failure of a node whose penalty a success resets, zero otherwise so that successes take
+	// no lock. A call picked before a later failure does not reset it.
+	failedAt time.Time
+}
+
+// newChoice returns a choice of n, without validUntil. fb.mu must be held.
+func newChoice(n *node) *choice {
+	c := &choice{sc: n.sc, addr: n.addr}
+	if n.penalty > 0 {
+		c.failedAt = n.failedAt
+	}
+	return c
 }
 
 // rank returns the READY nodes in the order to pick them at now:
 //
 //	unpenalized nodes  first, by configured order
-//	penalized nodes    last, by end of penalty, then oldest failure first, then by configured order
+//	penalized nodes    last, oldest failure first, then by configured order
 //
-// A penalty ends at penalizedUntil. With equal penalties, every penalized node is tried before one is retried.
+// A penalty ends at penalizedUntil.
 func rank(nodes []*node, now time.Time) []*node {
 	ready := slices.DeleteFunc(slices.Clone(nodes), func(n *node) bool { return n.sc == nil })
 	slices.SortFunc(ready, func(a, b *node) int {
@@ -121,8 +133,7 @@ func rank(nodes []*node, now time.Time) []*node {
 		case !aPenalized && bPenalized:
 			return -1
 		case aPenalized:
-			return cmp.Or(a.penalizedUntil.Compare(b.penalizedUntil), a.failedAt.Compare(b.failedAt),
-				cmp.Compare(a.order, b.order))
+			return cmp.Or(a.failedAt.Compare(b.failedAt), cmp.Compare(a.order, b.order))
 		}
 		return cmp.Compare(a.order, b.order)
 	})
@@ -136,7 +147,7 @@ func (fb *fallbackBalancer) refresh(now time.Time) {
 		fb.current.Store(nil)
 		return
 	}
-	c := &choice{sc: ranked[0].sc, addr: ranked[0].addr}
+	c := newChoice(ranked[0])
 	for _, n := range ranked {
 		if now.Before(n.penalizedUntil) && (c.validUntil.IsZero() || n.penalizedUntil.Before(c.validUntil)) {
 			c.validUntil = n.penalizedUntil
@@ -157,15 +168,12 @@ func (fb *fallbackBalancer) choose() *choice {
 	return fb.current.Load()
 }
 
-// maxPenalty caps the penalty of a node failing again and again: it still gets a call per maxPenalty. It is also how
-// long a node must go without failing after a penalty for the next one to start over: noticing a failure can take a
-// whole attempt timeout.
+// maxPenalty caps the penalty of a node failing again and again: it still gets a call per maxPenalty.
 const maxPenalty = time.Minute
 
 // penalize puts the node at addr behind the others, whether or not it is READY. Its penalty starts at fb.timeout and
-// doubles, up to maxPenalty, each time it fails again within maxPenalty after its penalty ended. Successes do not
-// reset it: a node may fail one method only, or answer slowly after failing. Failures during a penalty extend it
-// without doubling it: concurrent calls failing together are one outage.
+// doubles, up to maxPenalty, each time it fails again after its penalty ended, until it serves a call. Failures during
+// a penalty extend it without doubling it: concurrent calls failing together are one outage.
 func (fb *fallbackBalancer) penalize(addr string) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
@@ -175,11 +183,8 @@ func (fb *fallbackBalancer) penalize(addr string) {
 		return
 	}
 	now := fb.now()
-	switch {
-	case !now.Before(n.penalizedUntil.Add(maxPenalty)):
-		n.penalty = fb.timeout
-	case !now.Before(n.penalizedUntil):
-		n.penalty = min(2*n.penalty, max(maxPenalty, fb.timeout))
+	if n.penalty == 0 || !now.Before(n.penalizedUntil) {
+		n.penalty = min(max(2*n.penalty, fb.timeout), max(maxPenalty, fb.timeout))
 	}
 	fbLog.Warning("penalizing node", "addr", addr, "for", n.penalty)
 	n.failedAt = now
@@ -189,6 +194,17 @@ func (fb *fallbackBalancer) penalize(addr string) {
 	fb.refresh(now)
 }
 
+// forgive makes the next penalty of the node at addr start over, without ending the current one, if it did not fail
+// since failedAt. A node failing one method only is forgiven by its other ones.
+func (fb *fallbackBalancer) forgive(addr string, failedAt time.Time) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if n, ok := fb.nodes[addr]; ok && n.penalty > 0 && n.failedAt.Equal(failedAt) {
+		n.penalty = 0
+		fb.refresh(fb.now())
+	}
+}
+
 // other returns the best-ranked READY node not in avoid, or else the READY node that comes first in avoid, nil if no
 // node is READY.
 func (fb *fallbackBalancer) other(avoid []string) *choice {
@@ -196,12 +212,12 @@ func (fb *fallbackBalancer) other(avoid []string) *choice {
 	defer fb.mu.Unlock()
 	for _, n := range rank(slices.Collect(maps.Values(fb.nodes)), fb.now()) {
 		if !slices.Contains(avoid, n.addr) {
-			return &choice{sc: n.sc, addr: n.addr}
+			return newChoice(n)
 		}
 	}
 	for _, addr := range avoid {
 		if n, ok := fb.nodes[addr]; ok && n.sc != nil {
-			return &choice{sc: n.sc, addr: addr}
+			return newChoice(n)
 		}
 	}
 	return nil
@@ -364,8 +380,11 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{
 		SubConn: c.sc,
 		Done: func(di balancer.DoneInfo) {
-			if nodeFault(info.Ctx, di) {
+			switch {
+			case nodeFault(info.Ctx, di):
 				fb.penalize(c.addr)
+			case di.Err == nil && !c.failedAt.IsZero():
+				fb.forgive(c.addr, c.failedAt)
 			}
 		},
 		Metadata: metadata.MD{"target": []string{c.addr}},

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -212,18 +213,34 @@ func TestHealthRetriesAfterError(t *testing.T) {
 		return w.Code
 	}
 
+	served := func() []int64 {
+		counts := make([]int64, len(nodes))
+		for i, n := range nodes {
+			counts[i] = n.served.Load()
+		}
+		return counts
+	}
+
 	// until every node is READY, the retries may skip some
-	for deadline := time.Now().Add(5 * time.Second); nodes[2].served.Load() == 0; time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(5 * time.Second); slices.Contains(served(), 0); time.Sleep(10 * time.Millisecond) {
 		health()
 		if time.Now().After(deadline) {
 			t.Fatal("nodes never all READY")
 		}
 	}
-	// only the third node is current
+	before := served()
+	// a fails, b lags, the lag retry avoiding b fails on a and gets the current round from c
 	for range 3 {
 		if got := health(); got != http.StatusOK {
 			t.Errorf("GET /health = %d, want %d", got, http.StatusOK)
 		}
+	}
+	got := served()
+	for i := range got {
+		got[i] -= before[i]
+	}
+	if want := []int64{6, 3, 3}; !slices.Equal(got, want) {
+		t.Errorf("3 GET /health made %v calls to a, b, c, want %v", got, want)
 	}
 }
 

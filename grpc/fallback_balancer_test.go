@@ -97,12 +97,9 @@ func TestRank(t *testing.T) {
 			n("a", 0, ready, time.Second, time.Minute), n("b", 1, ready, 3*time.Second, time.Minute),
 			n("c", 2, ready, 2*time.Second, time.Minute),
 		}, []string{"b", "c", "a"}},
-		{"penalized by end of penalty, not by failure", []*node{
+		{"penalized by failure, not by end of penalty", []*node{
 			n("a", 0, ready, 2*time.Second, time.Hour), n("b", 1, ready, time.Second, time.Minute),
-		}, []string{"b", "a"}},
-		{"same end of penalty by oldest failure", []*node{
-			n("a", 0, ready, time.Second, time.Minute), n("b", 1, ready, 2*time.Second, time.Minute),
-		}, []string{"b", "a"}},
+		}, []string{"a", "b"}},
 		{"same failure by configured order", []*node{
 			n("b", 1, ready, time.Second, time.Minute), n("a", 0, ready, time.Second, time.Minute),
 		}, []string{"a", "b"}},
@@ -236,26 +233,28 @@ func TestPickerFailover(t *testing.T) {
 
 func TestPenaltyGrowth(t *testing.T) {
 	const base = 10 * time.Second
-	// step fails a call on a at after the end of its current penalty, once a served a call when succeed is set
+	// step fails a call on a at after the end of its current penalty
 	type step struct {
-		after   time.Duration
-		succeed bool
-		want    time.Duration // penalty of a after the failure
+		after time.Duration
+		// succeed completes a call on a picked just before the failure, held one picked before the failure after it
+		succeed, held bool
+		want          time.Duration // penalty of a after the failure
 	}
 	tests := []struct {
 		name  string
 		steps []step
 	}{
 		{"doubles up to the cap", []step{
-			{0, false, base}, {0, false, 2 * base}, {0, false, 4 * base}, {0, false, maxPenalty}, {0, false, maxPenalty},
+			{0, false, false, base}, {0, false, false, 2 * base}, {0, false, false, 4 * base},
+			{0, false, false, maxPenalty}, {0, false, false, maxPenalty},
 		}},
 		{"failure during a penalty does not double it", []step{
-			{0, false, base}, {0, false, 2 * base}, {-time.Second, false, 2 * base}, {0, false, 4 * base},
+			{0, false, false, base}, {0, false, false, 2 * base}, {-time.Second, false, false, 2 * base},
+			{0, false, false, 4 * base},
 		}},
-		{"success does not reset", []step{{0, false, base}, {0, false, 2 * base}, {time.Second, true, 4 * base}}},
-		{"quiet period resets", []step{{0, false, base}, {0, false, 2 * base}, {maxPenalty, false, base}}},
-		{"failure just before the end of the quiet period doubles", []step{
-			{0, false, base}, {maxPenalty - time.Nanosecond, true, 2 * base},
+		{"success resets", []step{{0, false, false, base}, {0, false, false, 2 * base}, {time.Second, true, false, base}}},
+		{"success picked before a failure does not reset", []step{
+			{0, false, false, base}, {0, false, true, 2 * base}, {0, false, false, 4 * base},
 		}},
 	}
 	for _, tt := range tests {
@@ -268,12 +267,19 @@ func TestPenaltyGrowth(t *testing.T) {
 				if end := tb.nodes["a"].penalizedUntil; !end.IsZero() {
 					tb.clock = end.Add(st.after)
 				}
+				var held func(error)
+				if st.held {
+					_, held = tb.pick(t, ctx)
+				}
 				if st.succeed {
 					_, done := tb.pick(t, ctx)
 					done(nil)
 				}
 				_, done := tb.pick(t, ctx)
 				done(status.Error(codes.Unavailable, "node down"))
+				if held != nil {
+					held(nil)
+				}
 				if got := tb.nodes["a"].penalizedUntil.Sub(tb.clock); got != st.want {
 					t.Errorf("penalty after step %d = %v, want %v", i, got, st.want)
 				}
@@ -286,6 +292,21 @@ func TestPenaltyGrowth(t *testing.T) {
 				t.Errorf("Pick() after the last penalty = %s, want a", got)
 			}
 		})
+	}
+}
+
+func TestSuccessPathLockFree(t *testing.T) {
+	tb := newTestBalancer("a", "b")
+	if c := tb.current.Load(); !c.failedAt.IsZero() {
+		t.Errorf("choice of a node that never failed = %+v, want no failure to forgive", c)
+	}
+	_, done := tb.pick(t, context.Background())
+	done(status.Error(codes.Unavailable, "node down"))
+	tb.clock = tb.nodes["a"].penalizedUntil
+	_, done = tb.pick(t, context.Background())
+	done(nil)
+	if c := tb.current.Load(); c.addr != "a" || !c.failedAt.IsZero() {
+		t.Errorf("choice after a success on a = %+v, want a with no failure to forgive", c)
 	}
 }
 
