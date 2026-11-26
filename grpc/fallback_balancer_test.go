@@ -231,6 +231,51 @@ func TestPickerFailover(t *testing.T) {
 	}
 }
 
+func TestPenaltyGrowth(t *testing.T) {
+	tb := newTestBalancer("a", "b")
+	tb.timeout = 10 * time.Second
+	ctx := context.Background()
+	unavailable := status.Error(codes.Unavailable, "node down")
+	fail := func(ctx context.Context) {
+		t.Helper()
+		if got, done := tb.pick(t, ctx); got != "a" {
+			t.Fatalf("Pick() = %s, want a", got)
+		} else {
+			done(unavailable)
+		}
+	}
+	penalty := func() time.Duration { return tb.nodes["a"].penalizedUntil.Sub(tb.clock) }
+
+	for i, want := range []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second, time.Minute, time.Minute} {
+		fail(ctx)
+		if got := penalty(); got != want {
+			t.Errorf("penalty after %d failures = %v, want %v", i+1, got, want)
+		}
+		tb.clock = tb.clock.Add(time.Second)
+		if got, _ := tb.pick(t, ctx); got != "b" {
+			t.Errorf("Pick() during penalty %d = %s, want b", i+1, got)
+		}
+		fail(AvoidNodes(ctx, "b"))
+		if got := penalty(); got != want {
+			t.Errorf("penalty after a failure during penalty %d = %v, want %v", i+1, got, want)
+		}
+		tb.clock = tb.nodes["a"].penalizedUntil
+	}
+
+	got, done := tb.pick(t, ctx)
+	if got != "a" {
+		t.Fatalf("Pick() after the penalties = %s, want a", got)
+	}
+	done(nil)
+	if c := tb.current.Load(); c.failed {
+		t.Errorf("choice after a success on a = %+v, want it not failed", c)
+	}
+	fail(ctx)
+	if got := penalty(); got != tb.timeout {
+		t.Errorf("penalty after a success and a failure = %v, want %v", got, tb.timeout)
+	}
+}
+
 func TestPickerStaysOnFirstNode(t *testing.T) {
 	tb := newTestBalancer("a", "b", "c")
 	for i := range 1000 {
@@ -411,7 +456,7 @@ func TestBalancerConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	for _, ctx := range ctxs {
 		wg.Go(func() {
-			for range iterations {
+			for i := range iterations {
 				res, err := p.Pick(balancer.PickInfo{Ctx: ctx})
 				if err != nil {
 					continue
@@ -419,7 +464,11 @@ func TestBalancerConcurrency(t *testing.T) {
 				if addr := res.Metadata["target"][0]; res.SubConn != tb.scs[addr] {
 					t.Errorf("Pick() = SubConn %p, target %s, want SubConn %p", res.SubConn, addr, tb.scs[addr])
 				}
-				res.Done(balancer.DoneInfo{Err: status.Error(codes.Unavailable, "node down")})
+				var failure error
+				if i%2 == 0 {
+					failure = status.Error(codes.Unavailable, "node down")
+				}
+				res.Done(balancer.DoneInfo{Err: failure})
 			}
 		})
 	}
