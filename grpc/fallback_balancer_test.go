@@ -231,6 +231,85 @@ func TestPickerFailover(t *testing.T) {
 	}
 }
 
+func TestPenaltyGrowth(t *testing.T) {
+	const base = 10 * time.Second
+	// step fails a call on a at after the end of its current penalty
+	type step struct {
+		after time.Duration
+		// succeed completes a call on a picked just before the failure, held one picked before the failure after it
+		succeed, held bool
+		want          time.Duration // penalty of a after the failure
+	}
+	tests := []struct {
+		name  string
+		steps []step
+	}{
+		{"doubles up to the cap", []step{
+			{0, false, false, base}, {0, false, false, 2 * base}, {0, false, false, 4 * base},
+			{0, false, false, maxPenalty}, {0, false, false, maxPenalty},
+		}},
+		{"failure during a penalty does not double it", []step{
+			{0, false, false, base}, {0, false, false, 2 * base}, {-time.Second, false, false, 2 * base},
+			{0, false, false, 4 * base},
+		}},
+		{"success resets", []step{{0, false, false, base}, {0, false, false, 2 * base}, {time.Second, true, false, base}}},
+		{"success picked before a failure does not reset", []step{
+			{0, false, false, base}, {0, false, true, 2 * base}, {0, false, false, 4 * base},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tb := newTestBalancer("a", "b")
+			tb.timeout = base
+			// a is picked even while penalized
+			ctx := AvoidNodes(context.Background(), "b")
+			for i, st := range tt.steps {
+				if end := tb.nodes["a"].penalizedUntil; !end.IsZero() {
+					tb.clock = end.Add(st.after)
+				}
+				var held func(error)
+				if st.held {
+					_, held = tb.pick(t, ctx)
+				}
+				if st.succeed {
+					_, done := tb.pick(t, ctx)
+					done(nil)
+				}
+				_, done := tb.pick(t, ctx)
+				done(status.Error(codes.Unavailable, "node down"))
+				if held != nil {
+					held(nil)
+				}
+				if got := tb.nodes["a"].penalizedUntil.Sub(tb.clock); got != st.want {
+					t.Errorf("penalty after step %d = %v, want %v", i, got, st.want)
+				}
+				if got, _ := tb.pick(t, context.Background()); got != "b" {
+					t.Errorf("Pick() during penalty %d = %s, want b", i, got)
+				}
+			}
+			tb.clock = tb.nodes["a"].penalizedUntil
+			if got, _ := tb.pick(t, context.Background()); got != "a" {
+				t.Errorf("Pick() after the last penalty = %s, want a", got)
+			}
+		})
+	}
+}
+
+func TestSuccessPathLockFree(t *testing.T) {
+	tb := newTestBalancer("a", "b")
+	if c := tb.current.Load(); !c.failedAt.IsZero() {
+		t.Errorf("choice of a node that never failed = %+v, want no failure to forgive", c)
+	}
+	_, done := tb.pick(t, context.Background())
+	done(status.Error(codes.Unavailable, "node down"))
+	tb.clock = tb.nodes["a"].penalizedUntil
+	_, done = tb.pick(t, context.Background())
+	done(nil)
+	if c := tb.current.Load(); c.addr != "a" || !c.failedAt.IsZero() {
+		t.Errorf("choice after a success on a = %+v, want a with no failure to forgive", c)
+	}
+}
+
 func TestPickerStaysOnFirstNode(t *testing.T) {
 	tb := newTestBalancer("a", "b", "c")
 	for i := range 1000 {
@@ -411,7 +490,7 @@ func TestBalancerConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	for _, ctx := range ctxs {
 		wg.Go(func() {
-			for range iterations {
+			for i := range iterations {
 				res, err := p.Pick(balancer.PickInfo{Ctx: ctx})
 				if err != nil {
 					continue
@@ -419,7 +498,11 @@ func TestBalancerConcurrency(t *testing.T) {
 				if addr := res.Metadata["target"][0]; res.SubConn != tb.scs[addr] {
 					t.Errorf("Pick() = SubConn %p, target %s, want SubConn %p", res.SubConn, addr, tb.scs[addr])
 				}
-				res.Done(balancer.DoneInfo{Err: status.Error(codes.Unavailable, "node down")})
+				var failure error
+				if i%2 == 0 {
+					failure = status.Error(codes.Unavailable, "node down")
+				}
+				res.Done(balancer.DoneInfo{Err: failure})
 			}
 		})
 	}
@@ -444,6 +527,11 @@ func TestNodeFault(t *testing.T) {
 	cancel()
 	expired, expire := context.WithTimeout(ctx, 0)
 	defer expire()
+	timedOut, timeOut := attemptContext(ctx, 0)
+	defer timeOut()
+	callerExpired, callerTimeOut := attemptContext(expired, time.Hour)
+	defer callerTimeOut()
+	deadline := status.Error(codes.DeadlineExceeded, "context deadline exceeded")
 	internal := status.Error(codes.Internal, "grpc: error while marshaling")
 	unavailable := status.Error(codes.Unavailable, "node down")
 	tests := []struct {
@@ -458,7 +546,12 @@ func TestNodeFault(t *testing.T) {
 		{"unavailable before any byte", ctx, balancer.DoneInfo{Err: unavailable}, true},
 		{"resource exhausted", ctx, balancer.DoneInfo{Err: status.Error(codes.ResourceExhausted, "busy")}, true},
 		{"unimplemented", ctx, balancer.DoneInfo{Err: status.Error(codes.Unimplemented, "old node")}, true},
-		{"deadline exceeded", expired, balancer.DoneInfo{Err: status.Error(codes.DeadlineExceeded, "slow")}, true},
+		{"deadline exceeded from the node", ctx, balancer.DoneInfo{Err: deadline, BytesSent: true, BytesReceived: true}, true},
+		{"deadline exceeded without an attempt", expired, balancer.DoneInfo{Err: deadline, BytesSent: true}, true},
+		{"attempt timeout", timedOut, balancer.DoneInfo{Err: deadline, BytesSent: true}, true},
+		{"attempt timeout while queued for a stream", timedOut, balancer.DoneInfo{Err: deadline}, false},
+		{"caller deadline", callerExpired, balancer.DoneInfo{Err: deadline, BytesSent: true}, false},
+		{"caller deadline during an outage", callerExpired, balancer.DoneInfo{Err: unavailable}, false},
 		{"unknown from the node", ctx, balancer.DoneInfo{Err: status.Error(codes.Unknown, "no beacon yet"), BytesReceived: true}, false},
 		{"caller cancel", cancelled, balancer.DoneInfo{Err: status.Error(codes.Canceled, "gone")}, false},
 		{"caller cancel during an outage", cancelled, balancer.DoneInfo{Err: unavailable}, false},

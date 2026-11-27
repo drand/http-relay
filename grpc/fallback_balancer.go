@@ -72,7 +72,7 @@ func (f fallbackBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) b
 type fallbackBalancer struct {
 	// Embeds balancer.Balancer because needs to intercept UpdateClientConnState to learn state.
 	balancer.Balancer
-	// timeout is how long a node stays behind the others after failing a call.
+	// timeout is the first penalty of a node, see penalize.
 	timeout time.Duration
 	now     func() time.Time
 
@@ -93,6 +93,8 @@ type node struct {
 	sc             balancer.SubConn // nil unless READY
 	failedAt       time.Time
 	penalizedUntil time.Time
+	// penalty is the length of the last penalty, zero once the node served a call.
+	penalty time.Duration
 }
 
 // choice is an immutable snapshot of the node to pick.
@@ -101,6 +103,18 @@ type choice struct {
 	addr string
 	// validUntil is when the first penalty among the READY nodes ends, zero if none is penalized.
 	validUntil time.Time
+	// failedAt is the last failure of a node whose penalty a success resets, zero otherwise so that successes take
+	// no lock. A call picked before a later failure does not reset it.
+	failedAt time.Time
+}
+
+// newChoice returns a choice of n, without validUntil. fb.mu must be held.
+func newChoice(n *node) *choice {
+	c := &choice{sc: n.sc, addr: n.addr}
+	if n.penalty > 0 {
+		c.failedAt = n.failedAt
+	}
+	return c
 }
 
 // rank returns the READY nodes in the order to pick them at now:
@@ -133,7 +147,7 @@ func (fb *fallbackBalancer) refresh(now time.Time) {
 		fb.current.Store(nil)
 		return
 	}
-	c := &choice{sc: ranked[0].sc, addr: ranked[0].addr}
+	c := newChoice(ranked[0])
 	for _, n := range ranked {
 		if now.Before(n.penalizedUntil) && (c.validUntil.IsZero() || n.penalizedUntil.Before(c.validUntil)) {
 			c.validUntil = n.penalizedUntil
@@ -154,8 +168,13 @@ func (fb *fallbackBalancer) choose() *choice {
 	return fb.current.Load()
 }
 
-// penalize puts the node at addr behind the others for at least d, whether or not it is READY.
-func (fb *fallbackBalancer) penalize(addr string, d time.Duration) {
+// maxPenalty caps the penalty of a node failing again and again: it still gets a call per maxPenalty.
+const maxPenalty = time.Minute
+
+// penalize puts the node at addr behind the others, whether or not it is READY. Its penalty starts at fb.timeout and
+// doubles, up to maxPenalty, each time it fails again after its penalty ended, until it serves a call. Failures during
+// a penalty extend it without doubling it: concurrent calls failing together are one outage.
+func (fb *fallbackBalancer) penalize(addr string) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	n, ok := fb.nodes[addr]
@@ -163,13 +182,27 @@ func (fb *fallbackBalancer) penalize(addr string, d time.Duration) {
 		// the resolver removed it
 		return
 	}
-	fbLog.Warning("penalizing node", "addr", addr, "for", d)
 	now := fb.now()
+	if n.penalty == 0 || !now.Before(n.penalizedUntil) {
+		n.penalty = min(max(2*n.penalty, fb.timeout), max(maxPenalty, fb.timeout))
+	}
+	fbLog.Warning("penalizing node", "addr", addr, "for", n.penalty)
 	n.failedAt = now
-	if until := now.Add(d); until.After(n.penalizedUntil) {
+	if until := now.Add(n.penalty); until.After(n.penalizedUntil) {
 		n.penalizedUntil = until
 	}
 	fb.refresh(now)
+}
+
+// forgive makes the next penalty of the node at addr start over, without ending the current one, if it did not fail
+// since failedAt. A node failing one method only is forgiven by its other ones.
+func (fb *fallbackBalancer) forgive(addr string, failedAt time.Time) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if n, ok := fb.nodes[addr]; ok && n.penalty > 0 && n.failedAt.Equal(failedAt) {
+		n.penalty = 0
+		fb.refresh(fb.now())
+	}
 }
 
 // other returns the best-ranked READY node not in avoid, or else the READY node that comes first in avoid, nil if no
@@ -179,12 +212,12 @@ func (fb *fallbackBalancer) other(avoid []string) *choice {
 	defer fb.mu.Unlock()
 	for _, n := range rank(slices.Collect(maps.Values(fb.nodes)), fb.now()) {
 		if !slices.Contains(avoid, n.addr) {
-			return &choice{sc: n.sc, addr: n.addr}
+			return newChoice(n)
 		}
 	}
 	for _, addr := range avoid {
 		if n, ok := fb.nodes[addr]; ok && n.sc != nil {
-			return &choice{sc: n.sc, addr: addr}
+			return newChoice(n)
 		}
 	}
 	return nil
@@ -347,8 +380,11 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	return balancer.PickResult{
 		SubConn: c.sc,
 		Done: func(di balancer.DoneInfo) {
-			if nodeFault(info.Ctx, di) {
-				fb.penalize(c.addr, fb.timeout)
+			switch {
+			case nodeFault(info.Ctx, di):
+				fb.penalize(c.addr)
+			case di.Err == nil && !c.failedAt.IsZero():
+				fb.forgive(c.addr, c.failedAt)
 			}
 		},
 		Metadata: metadata.MD{"target": []string{c.addr}},
@@ -356,15 +392,22 @@ func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 }
 
 // nodeFault reports whether the call failed because of the node, rather than the caller giving up, including on a
-// stalled stream, or asking for something the node cannot serve. drand nodes report unknown chains and rounds, and
-// chains without a beacon yet, as codes.Unknown, so only transport-level codes count. The client reports its own
-// failures, such as a request it cannot marshal, as codes.Internal before receiving anything from the node.
+// stalled stream, or asking for something the node cannot serve. Within an attempt started by Client.retry, the caller
+// gives up when its own context ends, and the attempt deadline is the node's fault. drand nodes report unknown chains and
+// rounds, and chains without a beacon yet, as codes.Unknown, so only transport-level codes count. The client reports
+// its own failures, such as a request it cannot marshal, as codes.Internal before receiving anything from the node.
 func nodeFault(ctx context.Context, di balancer.DoneInfo) bool {
 	if di.Err == nil || errors.Is(ctx.Err(), context.Canceled) {
 		return false
 	}
+	if caller, ok := ctx.Value(callerKey{}).(context.Context); ok && caller.Err() != nil {
+		return false
+	}
 	switch status.Code(di.Err) {
-	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted, codes.Unimplemented:
+	case codes.DeadlineExceeded:
+		// a call still queued behind the node's MaxConcurrentStreams never reached it
+		return di.BytesSent
+	case codes.Unavailable, codes.ResourceExhausted, codes.Unimplemented:
 		return true
 	case codes.Internal:
 		return di.BytesReceived

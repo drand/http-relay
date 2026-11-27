@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -138,11 +141,13 @@ func TestInvalidBeaconID(t *testing.T) {
 	}
 }
 
-// chainNode is a drand node serving the default chain, whose latest beacon is round().
+// chainNode is a drand node serving the default chain, whose latest beacon is round(). Its PublicRand fails with err
+// when set.
 type chainNode struct {
 	emptyNode
 	genesis int64
 	round   func() uint64
+	err     error
 	served  atomic.Int64
 }
 
@@ -160,7 +165,83 @@ func (n *chainNode) ChainInfo(context.Context, *proto.ChainInfoRequest) (*proto.
 
 func (n *chainNode) PublicRand(context.Context, *proto.PublicRandRequest) (*proto.PublicRandResponse, error) {
 	n.served.Add(1)
+	if n.err != nil {
+		return nil, n.err
+	}
 	return &proto.PublicRandResponse{Round: n.round()}, nil
+}
+
+// serveChain serves nodes on local TCP ports, and returns a router on a client of them, in order.
+func serveChain(t *testing.T, nodes ...*chainNode) http.Handler {
+	t.Helper()
+	addrs := make([]string, len(nodes))
+	for i, node := range nodes {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := ggrpc.NewServer()
+		proto.RegisterPublicServer(srv, node)
+		go func() { _ = srv.Serve(lis) }()
+		t.Cleanup(srv.Stop)
+		addrs[i] = lis.Addr().String()
+	}
+	client, err := grpc.NewClient("fallback:///"+strings.Join(addrs, ","), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	r := chi.NewRouter()
+	SetupRoutes(r, client)
+	return r
+}
+
+// TestHealthRetriesAfterError checks that /health retries a lagging node on another one than the node that answered,
+// when that answer itself came from a retry.
+func TestHealthRetriesAfterError(t *testing.T) {
+	genesis := time.Now().Unix() - 1000*chainPeriod
+	current := func() uint64 { return uint64((time.Now().Unix()-genesis)/chainPeriod) + 1 }
+	nodes := []*chainNode{
+		{genesis: genesis, round: current, err: errors.New("beacon not found")},
+		{genesis: genesis, round: func() uint64 { return 1 }},
+		{genesis: genesis, round: current},
+	}
+	r := serveChain(t, nodes...)
+	health := func() int {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v2/beacons/default/health", nil))
+		return w.Code
+	}
+
+	served := func() []int64 {
+		counts := make([]int64, len(nodes))
+		for i, n := range nodes {
+			counts[i] = n.served.Load()
+		}
+		return counts
+	}
+
+	// until every node is READY, the retries may skip some
+	for deadline := time.Now().Add(5 * time.Second); slices.Contains(served(), 0); time.Sleep(10 * time.Millisecond) {
+		health()
+		if time.Now().After(deadline) {
+			t.Fatal("nodes never all READY")
+		}
+	}
+	before := served()
+	// a fails, b lags, the lag retry avoiding b fails on a and gets the current round from c
+	for range 3 {
+		if got := health(); got != http.StatusOK {
+			t.Errorf("GET /health = %d, want %d", got, http.StatusOK)
+		}
+	}
+	got := served()
+	for i := range got {
+		got[i] -= before[i]
+	}
+	if want := []int64{6, 3, 3}; !slices.Equal(got, want) {
+		t.Errorf("3 GET /health made %v calls to a, b, c, want %v", got, want)
+	}
 }
 
 // TestHealthKeepsFirstNode checks that /health retries on another node when the latest beacon lags, without demoting
